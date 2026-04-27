@@ -57,6 +57,7 @@
 #include "clk_mgr.h"
 #include "atomfirmware.h"
 #include "vpg.h"
+#include "grph_object_id.h"
 
 #define DC_LOGGER \
 	dc_logger
@@ -74,6 +75,45 @@
 #define MAX_MTP_SLOT_COUNT 64
 #define LINK_TRAINING_ATTEMPTS 4
 #define PEAK_FACTOR_X1000 1006
+#define APPLE_5K_DPCD_PANEL_LATCH 0x4F1
+
+static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
+{
+	struct dc_link *root_link;
+	uint8_t payload = 1;
+	uint8_t readback = 0;
+	uint8_t root_readback = 0;
+	enum dc_status status;
+	enum dc_status read_status;
+	enum dc_status root_status;
+	enum dc_status root_read_status;
+
+	if (!dc_link_needs_tiled_stream_enable_latch(link) || !link->local_sink)
+		return;
+
+	DC_LOGGER_INIT(link->ctx->logger);
+
+	root_link = link->tiled_peer;
+	if (dc_link_has_tiled_root_panel_patch(root_link)) {
+		root_status = link_apple_5k_root_panel_latch_pulse(root_link);
+		root_read_status = core_link_read_dpcd(root_link,
+						       APPLE_5K_DPCD_PANEL_LATCH,
+						       &root_readback,
+						       sizeof(root_readback));
+		DC_LOG_INFO("APPLE5K: stream-enable root latch 0x4F1 slave_link[%u] root_link[%u] status=%d value=0x%02x read_status=%d readback=0x%02x root_sink=%p slave_sink=%p\n",
+			    link->link_index, root_link->link_index, root_status,
+			    payload, root_read_status, root_readback,
+			    root_link->local_sink, link->local_sink);
+	}
+
+	status = core_link_write_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
+				      &payload, sizeof(payload));
+	read_status = core_link_read_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
+					  &readback, sizeof(readback));
+	DC_LOG_INFO("APPLE5K: stream-enable latch 0x4F1 link[%u] status=%d value=0x%02x read_status=%d readback=0x%02x sink=%p\n",
+		    link->link_index, status, payload, read_status, readback,
+		    link->local_sink);
+}
 
 void link_blank_all_dp_displays(struct dc *dc)
 {
@@ -1073,6 +1113,7 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx)
 				&new_downspread.raw, sizeof(new_downspread));
 		}
 
+		dp_write_tiled_stream_enable_latch(link);
 	} else {
 		dm_helpers_mst_enable_stream_features(stream);
 	}

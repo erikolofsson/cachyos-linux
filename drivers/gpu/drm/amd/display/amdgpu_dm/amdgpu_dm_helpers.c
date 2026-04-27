@@ -48,7 +48,6 @@
 #include "dm_helpers.h"
 #include "ddc_service_types.h"
 #include "clk_mgr.h"
-
 static u32 edid_extract_panel_id(struct edid *edid)
 {
 	return (u32)edid->mfg_id[0] << 24   |
@@ -56,9 +55,145 @@ static u32 edid_extract_panel_id(struct edid *edid)
 	       (u32)EDID_PRODUCT_ID(edid);
 }
 
-static void apply_edid_quirks(struct drm_device *dev, struct edid *edid, struct dc_edid_caps *edid_caps)
+static void edid_panel_id_to_str(const struct edid *edid, char *buf, size_t len)
 {
+	u16 code = ((u16)edid->mfg_id[0] << 8) | edid->mfg_id[1];
+	char mfg[4];
+
+	mfg[0] = 'A' + ((code >> 10) & 0x1f) - 1;
+	mfg[1] = 'A' + ((code >> 5) & 0x1f) - 1;
+	mfg[2] = 'A' + (code & 0x1f) - 1;
+	mfg[3] = '\0';
+
+	snprintf(buf, len, "%s/%04X", mfg, EDID_PRODUCT_ID(edid));
+}
+
+static bool edid_is_apple_panel(const struct edid *edid)
+{
+	u16 code = ((u16)edid->mfg_id[0] << 8) | edid->mfg_id[1];
+	char a = 'A' + ((code >> 10) & 0x1f) - 1;
+	char p1 = 'A' + ((code >> 5) & 0x1f) - 1;
+	char p2 = 'A' + (code & 0x1f) - 1;
+
+	return a == 'A' && p1 == 'P' && p2 == 'P';
+}
+
+static void edid_extension_tags_to_str(const struct edid *edid,
+				       char *buf, size_t len)
+{
+	size_t pos = 0;
+	u8 i;
+
+	if (!len)
+		return;
+
+	buf[0] = '\0';
+	for (i = 1; i <= edid->extensions; i++) {
+		const u8 *block = (const u8 *)edid + i * EDID_LENGTH;
+
+		pos += scnprintf(buf + pos, len - pos, "%s0x%02X",
+				 pos ? "," : "", block[0]);
+		if (pos >= len)
+			break;
+	}
+}
+
+/*
+ * Called from dm_helpers_parse_edid_caps() after apply_edid_quirks() has
+ * (possibly) set the tiled_root_* / tiled_slave_* flags on this link's
+ * edid_caps. If so, walk the dc's links and cross-wire tiled_peer between
+ * this link and its tile-pair peer so DC-core consumers on the slave's
+ * pre-detect path (where slave's local_sink is NULL) can still reach the
+ * root's panel-patch.
+ *
+ * Current supported wiring has one eDP root and one internal DP slave.
+ * From the root side, pick the first DP sibling. From the slave side,
+ * pick the first eDP sibling already carrying the root flag.
+ */
+static void dm_helpers_wire_tiled_peer(struct drm_device *dev,
+				       struct dc_link *link,
+				       const struct dc_edid_caps *edid_caps)
+{
+	const struct dc_panel_patch *pp = &edid_caps->panel_patch;
+	bool is_root = pp->tiled_root_force_edid_reread &&
+		       link->connector_signal == SIGNAL_TYPE_EDP;
+	bool is_slave = pp->tiled_slave_root_wake &&
+			link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT;
+	uint32_t i;
+
+	if (!link->dc || (!is_root && !is_slave))
+		return;
+	if (link->tiled_peer) {
+		drm_info(dev,
+			 "APPLE5K: tiled_peer already wired link[%u] -> link[%u]\n",
+			 link->link_index, link->tiled_peer->link_index);
+		return; /* already wired */
+	}
+
+	drm_info(dev,
+		 "APPLE5K: peer scan role=%s link[%u] signal=%d link_count=%u\n",
+		 is_root ? "root" : "slave", link->link_index,
+		 link->connector_signal, link->dc->link_count);
+
+	for (i = 0; i < link->dc->link_count; i++) {
+		struct dc_link *other = link->dc->links[i];
+
+		if (!other || other == link)
+			continue;
+
+		drm_info(dev,
+			 "APPLE5K: peer candidate link[%u] signal=%d internal=%d aux=%d has_sink=%d has_peer=%d ddc_hw=%u hpd_src=%u enc=%u eng=%d\n",
+			 other->link_index, other->connector_signal,
+			 other->is_internal_display, other->aux_mode,
+			 !!other->local_sink, !!other->tiled_peer,
+			 other->ddc_hw_inst, other->hpd_src,
+			 other->link_enc_hw_inst, other->eng_id);
+	}
+
+	for (i = 0; i < link->dc->link_count; i++) {
+		struct dc_link *other = link->dc->links[i];
+
+		if (!other || other == link || other->tiled_peer)
+			continue;
+
+		if (is_root && other->connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
+			link->tiled_peer = other;
+			other->tiled_peer = link;
+			drm_info(dev,
+				 "APPLE5K: tiled_peer wired root link[%u] <-> dp link[%u]\n",
+				 link->link_index, other->link_index);
+			return;
+		}
+		if (is_slave && other->connector_signal == SIGNAL_TYPE_EDP &&
+		    other->local_sink &&
+		    other->local_sink->edid_caps.panel_patch.tiled_root_force_edid_reread) {
+			link->tiled_peer = other;
+			other->tiled_peer = link;
+			drm_info(dev,
+				 "APPLE5K: tiled_peer wired slave link[%u] <-> edp link[%u]\n",
+				 link->link_index, other->link_index);
+			return;
+		}
+	}
+
+	drm_info(dev, "APPLE5K: peer scan found no peer for link[%u]\n",
+		 link->link_index);
+}
+
+static void apply_edid_quirks(struct drm_device *dev,
+			      struct dc_link *link,
+			      struct edid *edid,
+			      struct dc_edid_caps *edid_caps)
+{
+	enum signal_type connector_signal =
+		link ? link->connector_signal : SIGNAL_TYPE_NONE;
 	uint32_t panel_id = edid_extract_panel_id(edid);
+	char panel[16];
+	char ext_tags[96];
+	bool apple_panel = edid_is_apple_panel(edid);
+
+	edid_panel_id_to_str(edid, panel, sizeof(panel));
+	edid_extension_tags_to_str(edid, ext_tags, sizeof(ext_tags));
 
 	switch (panel_id) {
 	/* Workaround for monitors that need a delay after detecting the link */
@@ -87,7 +222,62 @@ static void apply_edid_quirks(struct drm_device *dev, struct edid *edid, struct 
 		drm_dbg_driver(dev, "Disabling VSC on monitor with panel id %X\n", panel_id);
 		edid_caps->panel_patch.disable_colorimetry = true;
 		break;
+	/*
+	 * Apple 27" 5K dual-tile internal panel (iMac15,1 / 17,1 / 18,3 / 19,1 / 20,x / iMacPro1,1).
+	 * Older family: AE01 root-compat, AE02 tile identity.
+	 * iMac17,1 family: AE05 root-compat, AE06 tile identity.
+	 * iMac18,3 family: AE11 root-compat, AE12 tile identity; AE13 is the
+	 * DisplayID tiled-display product ID, not a base EDID panel ID.
+	 * iMac Pro family: AE1D root-compat, AE1E tile identity.
+	 * Newer family: AE25 root-compat, AE26 tile identity.
+	 * 2020 family: AE31 root-compat, AE32 tile identity; AE33 is the
+	 * DisplayID tiled-display product ID, not a base EDID panel ID.
+	 * Role discrimination is by connector_signal (eDP=root, DP=slave) — not by
+	 * panel-id alone, since the primary can flip after the wake.
+	 */
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE01):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE02):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE05):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE06):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE11):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE12):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE1D):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE1E):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE25):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE26):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE31):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE32):
+		if (connector_signal == SIGNAL_TYPE_EDP) {
+			edid_caps->panel_patch.tiled_root_force_edid_reread = 1;
+			edid_caps->panel_patch.prefer_tile_native_mode = 1;
+		} else if (connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
+			edid_caps->panel_patch.tiled_slave_root_wake = 1;
+			edid_caps->panel_patch.tiled_slave_source_table_rev = 1;
+			edid_caps->panel_patch.tiled_stream_enable_latch = 1;
+			edid_caps->panel_patch.aux_ready_before_link_training = 1;
+			edid_caps->panel_patch.prefer_tile_native_mode = 1;
+		}
+		drm_info(dev,
+			 "APPLE5K: panel match base=%s panel_id=0x%X signal=%d link[%u] name=\"%s\" ext=%u tags=%s flags root_reread=%u slave_wake=%u source_dpcd=%u stream_latch=%u aux_ready=%u prefer_tile=%u\n",
+			 panel, panel_id, connector_signal,
+			 link ? link->link_index : 0xffffffff,
+			 edid_caps->display_name, edid->extensions,
+			 ext_tags[0] ? ext_tags : "none",
+			 edid_caps->panel_patch.tiled_root_force_edid_reread,
+			 edid_caps->panel_patch.tiled_slave_root_wake,
+			 edid_caps->panel_patch.tiled_slave_source_table_rev,
+			 edid_caps->panel_patch.tiled_stream_enable_latch,
+			 edid_caps->panel_patch.aux_ready_before_link_training,
+			 edid_caps->panel_patch.prefer_tile_native_mode);
+		break;
 	default:
+		if (apple_panel)
+			drm_info(dev,
+				 "APPLE5K: Apple panel not matched base=%s panel_id=0x%X signal=%d link[%u] name=\"%s\" ext=%u tags=%s\n",
+				 panel, panel_id, connector_signal,
+				 link ? link->link_index : 0xffffffff,
+				 edid_caps->display_name, edid->extensions,
+				 ext_tags[0] ? ext_tags : "none");
 		return;
 	}
 }
@@ -147,7 +337,8 @@ enum dc_edid_status dm_helpers_parse_edid_caps(
 	if (edid_caps->edid_hdmi)
 		populate_hdmi_info_from_connector(&connector->display_info.hdmi, edid_caps);
 
-	apply_edid_quirks(dev, edid_buf, edid_caps);
+	apply_edid_quirks(dev, link, edid_buf, edid_caps);
+	dm_helpers_wire_tiled_peer(dev, link, edid_caps);
 
 	sad_count = drm_edid_to_sad((struct edid *) edid->raw_edid, &sads);
 	if (sad_count <= 0)
@@ -1110,6 +1301,7 @@ enum dc_edid_status dm_helpers_read_local_edid(
 		DRM_ERROR("EDID err: %d, on connector: %s",
 				edid_status,
 				aconnector->base.name);
+
 	if (link->aux_mode) {
 		union test_request test_request = {0};
 		union test_response test_response = {0};

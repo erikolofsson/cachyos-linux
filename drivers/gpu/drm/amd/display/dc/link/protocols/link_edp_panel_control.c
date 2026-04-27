@@ -28,6 +28,8 @@
  * as PSR and ABM and it also manages specs defined eDP panel power sequences.
  */
 
+#include <linux/dmi.h>
+
 #include "link_edp_panel_control.h"
 #include "link_dpcd.h"
 #include "link_dp_capability.h"
@@ -40,11 +42,17 @@
 #include "abm.h"
 #include "resource.h"
 #include "link_dp_panel_replay.h"
+#include "grph_object_id.h"
 #define DC_LOGGER \
 	link->ctx->logger
 #define DC_LOGGER_INIT(logger)
 
 #define DP_SINK_PR_ENABLE_AND_CONFIGURATION		0x37B
+
+static bool link_needs_tiled_slave_assr_route(const struct dc_link *link)
+{
+	return dc_link_has_tiled_slave_panel_patch(link);
+}
 
 /* Travis */
 static const uint8_t DP_VGA_LVDS_CONVERTER_ID_2[] = "sivarT";
@@ -141,6 +149,9 @@ enum dp_panel_mode dp_get_panel_mode(struct dc_link *link)
 			break;
 		}
 	}
+
+	if (link_needs_tiled_slave_assr_route(link))
+		return DP_PANEL_MODE_EDP;
 
 	if (link->dpcd_caps.panel_mode_edp &&
 		(link->connector_signal == SIGNAL_TYPE_EDP ||

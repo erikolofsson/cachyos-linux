@@ -183,6 +183,18 @@ struct dc_panel_patch {
 	bool oled_optimize_display_on;
 	unsigned int force_mst_blocked_discovery;
 	unsigned int wait_after_dpcd_poweroff_ms;
+	unsigned int aux_ready_before_link_training; /* require observed AUX response before LT */
+	unsigned int prefer_tile_native_mode;        /* prefer modes matching DRM tile size */
+
+	/*
+	 * Internal tiled-panel quirks. EDID quirks identify the panel once and
+	 * set these role flags; consumers combine them with connector signal,
+	 * DRM tile metadata and link->tiled_peer where ordering requires it.
+	 */
+	unsigned int tiled_slave_root_wake;          /* DP slave: pulse root 0x4F1 before AUX */
+	unsigned int tiled_slave_source_table_rev;   /* DP slave: publish source-DPCD 0x310 = 04 1d 03 */
+	unsigned int tiled_root_force_edid_reread;   /* eDP root: re-read EDID after slave exposes tile metadata */
+	unsigned int tiled_stream_enable_latch;      /* DP slave: 0x4F1=1 at stream-enable */
 };
 
 /**

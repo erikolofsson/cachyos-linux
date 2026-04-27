@@ -1744,6 +1744,13 @@ struct dc_scratch_space {
 	struct dc_dpia_bw_alloc dpia_bw_alloc_config;
 	bool skip_implict_edp_power_control;
 	enum backlight_control_type backlight_control_type;
+
+	/*
+	 * Peer link of a paired tiled panel. Set symmetrically by amdgpu_dm
+	 * at EDID-parse time so pre-sink slave paths can consult the root's
+	 * panel-patch.
+	 */
+	struct dc_link *tiled_peer;
 };
 
 struct dc {
@@ -2684,6 +2691,91 @@ struct dc_sink {
 
 void dc_sink_retain(struct dc_sink *sink);
 void dc_sink_release(struct dc_sink *sink);
+
+static inline const struct dc_panel_patch *
+dc_link_get_panel_patch(const struct dc_link *link)
+{
+	if (!link || !link->local_sink)
+		return NULL;
+
+	return &link->local_sink->edid_caps.panel_patch;
+}
+
+static inline bool dc_link_has_tiled_root_panel_patch(const struct dc_link *link)
+{
+	const struct dc_panel_patch *patch = dc_link_get_panel_patch(link);
+
+	return link &&
+	       link->connector_signal == SIGNAL_TYPE_EDP &&
+	       patch &&
+	       patch->tiled_root_force_edid_reread;
+}
+
+static inline bool dc_link_has_tiled_slave_panel_patch(const struct dc_link *link)
+{
+	const struct dc_panel_patch *patch;
+
+	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
+		return false;
+
+	patch = dc_link_get_panel_patch(link);
+	if (patch && patch->tiled_slave_root_wake)
+		return true;
+
+	/* Pre-sink slave paths can still inherit the root's tiled-panel quirk. */
+	return dc_link_has_tiled_root_panel_patch(link->tiled_peer);
+}
+
+static inline bool dc_link_needs_tiled_slave_root_wake(const struct dc_link *link)
+{
+	const struct dc_panel_patch *patch;
+
+	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
+		return false;
+
+	patch = dc_link_get_panel_patch(link);
+	if (patch && patch->tiled_slave_root_wake)
+		return true;
+
+	return dc_link_has_tiled_root_panel_patch(link->tiled_peer);
+}
+
+static inline bool dc_link_needs_pre_training_aux_ready(const struct dc_link *link)
+{
+	const struct dc_panel_patch *patch = dc_link_get_panel_patch(link);
+
+	if (patch && patch->aux_ready_before_link_training)
+		return true;
+
+	return dc_link_needs_tiled_slave_root_wake(link);
+}
+
+static inline bool dc_link_needs_tiled_slave_source_table_rev(const struct dc_link *link)
+{
+	const struct dc_panel_patch *patch = dc_link_get_panel_patch(link);
+
+	return link &&
+	       link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT &&
+	       patch &&
+	       patch->tiled_slave_source_table_rev;
+}
+
+static inline bool dc_link_needs_tiled_stream_enable_latch(const struct dc_link *link)
+{
+	const struct dc_panel_patch *patch = dc_link_get_panel_patch(link);
+
+	return link &&
+	       link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT &&
+	       patch &&
+	       patch->tiled_stream_enable_latch;
+}
+
+static inline bool dc_link_prefers_tile_native_mode(const struct dc_link *link)
+{
+	const struct dc_panel_patch *patch = dc_link_get_panel_patch(link);
+
+	return patch && patch->prefer_tile_native_mode;
+}
 
 struct dc_sink_init_data {
 	enum signal_type sink_signal;

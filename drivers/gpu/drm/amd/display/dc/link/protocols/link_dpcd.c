@@ -248,3 +248,18 @@ enum dc_status core_link_write_dpcd(
 	}
 	return status;
 }
+
+/* Apple 5K dual-tile internal panel: DPCD 0x4F1 = root panel-latch.
+ * Writing 1 wakes the panel; the slave's AUX comes up shortly after. */
+#define APPLE_5K_DPCD_ROOT_PANEL_LATCH 0x4F1
+
+enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
+{
+	uint8_t payload = 1;
+
+	if (!dc_link_has_tiled_root_panel_patch(root_link))
+		return DC_OK;
+
+	return core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
+				    &payload, sizeof(payload));
+}

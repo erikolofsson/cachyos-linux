@@ -59,6 +59,7 @@
 #include "link_hwss.h"
 #include "link_encoder.h"
 #include "link_enc_cfg.h"
+#include "grph_object_id.h"
 
 #include "link_service.h"
 #include "dm_helpers.h"
@@ -1656,23 +1657,32 @@ static void program_timing_sync(
 		 * same timing, add all tgs with same timing to the group
 		 */
 		for (j = i + 1; j < pipe_count; j++) {
+			bool timing_sync = false;
+			bool vblank_sync = false;
+
 			if (!unsynced_pipes[j])
 				continue;
+
 			if (sync_type != TIMING_SYNCHRONIZABLE &&
-				dc->hwss.enable_vblanks_synchronization &&
-				unsynced_pipes[j]->stream_res.tg->funcs->align_vblanks &&
-				resource_are_vblanks_synchronizable(
-					unsynced_pipes[j]->stream,
-					pipe_set[0]->stream)) {
+			    dc->hwss.enable_vblanks_synchronization &&
+			    unsynced_pipes[j]->stream_res.tg->funcs->align_vblanks)
+				vblank_sync = resource_are_vblanks_synchronizable(
+						unsynced_pipes[j]->stream,
+						pipe_set[0]->stream);
+
+			if (sync_type != VBLANK_SYNCHRONIZABLE)
+				timing_sync = resource_are_streams_timing_synchronizable(
+						unsynced_pipes[j]->stream,
+						pipe_set[0]->stream);
+
+			if (sync_type != TIMING_SYNCHRONIZABLE &&
+			    vblank_sync) {
 				sync_type = VBLANK_SYNCHRONIZABLE;
 				pipe_set[group_size] = unsynced_pipes[j];
 				unsynced_pipes[j] = NULL;
 				group_size++;
-			} else
-			if (sync_type != VBLANK_SYNCHRONIZABLE &&
-				resource_are_streams_timing_synchronizable(
-					unsynced_pipes[j]->stream,
-					pipe_set[0]->stream)) {
+			} else if (sync_type != VBLANK_SYNCHRONIZABLE &&
+				   timing_sync) {
 				sync_type = TIMING_SYNCHRONIZABLE;
 				pipe_set[group_size] = unsynced_pipes[j];
 				unsynced_pipes[j] = NULL;
@@ -1711,7 +1721,6 @@ static void program_timing_sync(
 				status->timing_sync_info.master = true;
 			else
 				status->timing_sync_info.master = false;
-
 		}
 
 		/* remove any other unblanked pipes as they have already been synced */
@@ -7561,4 +7570,3 @@ bool dc_update_planes_and_stream_cleanup(
 			? update_planes_and_stream_cleanup_v3(scratch)
 			: update_planes_and_stream_cleanup_v2(scratch);
 }
-

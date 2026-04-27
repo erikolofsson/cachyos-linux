@@ -50,11 +50,15 @@
 #include "link_enc_cfg.h"
 #include "dc_dmub_srv.h"
 #include "gpio_service_interface.h"
+#include "grph_object_id.h"
 
 #define DC_TRACE_LEVEL_MESSAGE(...) /* do nothing */
 
 #define DC_LOGGER \
 	link->ctx->logger
+
+#define DP_SOURCE_DPCD_AUX_READY_ATTEMPTS 3
+#define DP_SOURCE_DPCD_AUX_READY_COOLDOWN_US 1000
 
 #ifndef MAX
 #define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
@@ -62,6 +66,83 @@
 #ifndef MIN
 #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
 #endif
+
+static void dpcd_set_tiled_slave_source_table_revision(
+	struct dc_link *link)
+{
+	uint8_t table_revision[3];
+	uint8_t readback[3] = { 0 };
+	enum dc_status status;
+	enum dc_status read_status;
+	uint8_t auto_revision;
+
+	if (!dc_link_needs_tiled_slave_source_table_rev(link) ||
+	    !link->ctx || !link->dc)
+		return;
+
+	auto_revision = link->ctx->dce_version >= DCE_VERSION_12_0 ?
+			0x05 : 0x04;
+	table_revision[0] = 0x04;
+	table_revision[1] = 0x1d;
+	table_revision[2] = 0x03;
+
+	status = core_link_write_dpcd(link, DP_SOURCE_TABLE_REVISION,
+				      table_revision, sizeof(table_revision));
+	read_status = core_link_read_dpcd(link, DP_SOURCE_TABLE_REVISION,
+					  readback, sizeof(readback));
+	DC_LOG_INFO("APPLE5K: source DPCD 0x310 write link[%u] status=%d value=%02x %02x %02x read_status=%d readback=%02x %02x %02x dce=%d auto_first=%02x force_apple5k_legacy=1\n",
+		    link->link_index, status, table_revision[0],
+		    table_revision[1], table_revision[2],
+		    read_status, readback[0], readback[1], readback[2],
+		    link->ctx->dce_version, auto_revision);
+}
+
+static bool dp_prepare_source_dpcd_write(struct dc_link *link)
+{
+	uint8_t dpcd_rev;
+	uint8_t power_state = DP_POWER_STATE_D0;
+	unsigned int try;
+
+	if (!dc_link_needs_tiled_slave_root_wake(link))
+		return true;
+
+	for (try = 0; try < DP_SOURCE_DPCD_AUX_READY_ATTEMPTS; try++) {
+		enum dc_status wake_status;
+		enum dc_status power_status;
+		enum dc_status rev_status;
+
+		wake_status = link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
+		DC_LOG_INFO("APPLE5K: root wake 0x4F1 stage=source-dpcd slave_link[%u] root_link[%d] try=%u status=%d\n",
+			    link->link_index,
+			    link->tiled_peer ? (int)link->tiled_peer->link_index : -1,
+			    try, wake_status);
+
+		power_status = core_link_write_dpcd(link, DP_SET_POWER,
+						    &power_state,
+						    sizeof(power_state));
+		if (power_status != DC_OK) {
+			DC_LOG_INFO("APPLE5K: source-DPCD AUX power write failed link[%u] try=%u status=%d\n",
+				    link->link_index, try, power_status);
+			goto retry;
+		}
+
+		dpcd_rev = 0;
+		rev_status = core_link_read_dpcd(link, DP_DPCD_REV,
+						 &dpcd_rev, sizeof(dpcd_rev));
+		DC_LOG_INFO("APPLE5K: source-DPCD AUX rev poll link[%u] try=%u status=%d dpcd_rev=0x%02x\n",
+			    link->link_index, try, rev_status, dpcd_rev);
+		if (rev_status == DC_OK && dpcd_rev != 0)
+			return true;
+
+retry:
+		if (try + 1 < DP_SOURCE_DPCD_AUX_READY_ATTEMPTS)
+			fsleep(DP_SOURCE_DPCD_AUX_READY_COOLDOWN_US);
+	}
+
+	DC_LOG_INFO("APPLE5K: source-DPCD AUX not ready link[%u] attempts=%u\n",
+		    link->link_index, DP_SOURCE_DPCD_AUX_READY_ATTEMPTS);
+	return false;
+}
 
 struct dp_lt_fallback_entry {
 	enum dc_lane_count lane_count;
@@ -1405,6 +1486,9 @@ bool dp_overwrite_extended_receiver_cap(struct dc_link *link)
 
 void dpcd_set_source_specific_data(struct dc_link *link)
 {
+	if (!dp_prepare_source_dpcd_write(link))
+		return;
+
 	if (!link->dc->vendor_signature.is_valid) {
 		enum dc_status __maybe_unused result_write_min_hblank = DC_NOT_SUPPORTED;
 		struct dpcd_amd_signature amd_signature = {0};
@@ -1484,6 +1568,8 @@ void dpcd_set_source_specific_data(struct dc_link *link)
 				link->dc->vendor_signature.data.raw,
 				sizeof(link->dc->vendor_signature.data.raw));
 	}
+
+	dpcd_set_tiled_slave_source_table_revision(link);
 }
 
 void dpcd_write_cable_id_to_dprx(struct dc_link *link)

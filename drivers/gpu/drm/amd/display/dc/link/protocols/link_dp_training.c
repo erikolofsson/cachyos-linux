@@ -1090,12 +1090,87 @@ enum dc_status dpcd_set_training_pattern(
 	return status;
 }
 
+/*
+ * Some embedded DP sinks expose AUX before they are consistently ready for
+ * link-training writes. For panels that request it, make training conditional
+ * on an observed AUX response after any panel-specific pre-training wake.
+ */
+#define DP_LT_AUX_READY_ATTEMPTS           3
+#define DP_LT_AUX_READY_COOLDOWN_US        1000
+#define DP_LT_DPCD_WRITE_RETRIES           4
+
+static void dp_pre_link_training_wake(struct dc_link *link)
+{
+	enum dc_status status;
+
+	if (!link)
+		return;
+
+	if (dc_link_needs_tiled_slave_root_wake(link)) {
+		status = link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
+		DC_LOG_INFO("APPLE5K: root wake 0x4F1 stage=training slave_link[%u] root_link[%d] status=%d\n",
+			    link->link_index,
+			    link->tiled_peer ? (int)link->tiled_peer->link_index : -1,
+			    status);
+	}
+}
+
+static bool dp_prepare_sink_for_link_training(struct dc_link *link,
+					      unsigned int attempts)
+{
+	uint8_t dpcd_rev;
+	uint8_t power_state = DP_POWER_STATE_D0;
+	unsigned int try;
+
+	if (!link || link->aux_access_disabled ||
+	    !dc_link_needs_pre_training_aux_ready(link))
+		return true;
+
+	for (try = 0; try < attempts; try++) {
+		enum dc_status power_status;
+		enum dc_status rev_status;
+
+		dp_pre_link_training_wake(link);
+
+		power_status = core_link_write_dpcd(link, DP_SET_POWER,
+						    &power_state,
+						    sizeof(power_state));
+		if (power_status != DC_OK) {
+			DC_LOG_INFO("APPLE5K: training AUX power write failed link[%u] try=%u status=%d\n",
+				    link->link_index, try, power_status);
+			goto retry;
+		}
+
+		dpcd_rev = 0;
+		rev_status = core_link_read_dpcd(link, DP_DPCD_REV,
+						 &dpcd_rev, sizeof(dpcd_rev));
+		DC_LOG_INFO("APPLE5K: training AUX rev poll link[%u] try=%u status=%d dpcd_rev=0x%02x\n",
+			    link->link_index, try, rev_status, dpcd_rev);
+		if (rev_status == DC_OK && dpcd_rev != 0)
+			return true;
+
+retry:
+		if (try + 1 < attempts)
+			fsleep(DP_LT_AUX_READY_COOLDOWN_US);
+	}
+
+	DC_LOG_INFO("APPLE5K: training AUX not ready link[%u] attempts=%u\n",
+		    link->link_index, attempts);
+	return false;
+}
+
 enum dc_status dpcd_set_link_settings(
 	struct dc_link *link,
 	const struct link_training_settings *lt_settings)
 {
-	uint8_t rate;
+	uint8_t rate = 0;
 	enum dc_status status;
+	bool retry_dpcd_writes = dc_link_needs_pre_training_aux_ready(link);
+	unsigned int retry = 0;
+	enum dc_status ds_status = DC_OK;
+	enum dc_status lc_status = DC_OK;
+	enum dc_status bw_status = DC_OK;
+	enum dc_status rate_status = DC_OK;
 
 	union down_spread_ctrl downspread = {0};
 	union lane_count_set lane_count_set = {0};
@@ -1116,44 +1191,101 @@ enum dc_status dpcd_set_link_settings(
 				link->dpcd_caps.max_ln_count.bits.POST_LT_ADJ_REQ_SUPPORTED;
 	}
 
-	status = core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
-		&downspread.raw, sizeof(downspread));
-	if (status != DC_OK)
-		DC_LOG_ERROR("%s:%d: core_link_write_dpcd (DP_DOWNSPREAD_CTRL) failed\n", __func__, __LINE__);
+	/*
+	 * Keep retryable link-config writes tied to observed sink AUX readiness
+	 * instead of a fixed wake delay.
+	 */
+	if (dc_link_needs_tiled_slave_root_wake(link))
+		DC_LOG_INFO("APPLE5K: link-config start link[%u] rate=%d rate_set=%d use_rate_set=%d lanes=%d spread=%d enhanced=%d retries=%u reported_rate=%d reported_lanes=%d verified_rate=%d verified_lanes=%d\n",
+			    link->link_index,
+			    lt_settings->link_settings.link_rate,
+			    lt_settings->link_settings.link_rate_set,
+			    lt_settings->link_settings.use_link_rate_set,
+			    lt_settings->link_settings.lane_count,
+			    lt_settings->link_settings.link_spread,
+			    lt_settings->enhanced_framing,
+			    DP_LT_DPCD_WRITE_RETRIES,
+			    link->reported_link_cap.link_rate,
+			    link->reported_link_cap.lane_count,
+			    link->verified_link_cap.link_rate,
+			    link->verified_link_cap.lane_count);
 
-	status = core_link_write_dpcd(link, DP_LANE_COUNT_SET,
-		&lane_count_set.raw, 1);
-	if (status != DC_OK)
-		DC_LOG_ERROR("%s:%d: core_link_write_dpcd (DP_LANE_COUNT_SET) failed\n", __func__, __LINE__);
-
-	if (link->dpcd_caps.dpcd_rev.raw >= DPCD_REV_13 &&
-			lt_settings->link_settings.use_link_rate_set == true) {
-		rate = 0;
-		/* WA for some MUX chips that will power down with eDP and lose supported
-		 * link rate set for eDP 1.4. Source reads DPCD 0x010 again to ensure
-		 * MUX chip gets link rate set back before link training.
-		 */
-		if (link->connector_signal == SIGNAL_TYPE_EDP) {
-			uint8_t supported_link_rates[16] = {0};
-
-			core_link_read_dpcd(link, DP_SUPPORTED_LINK_RATES,
-					supported_link_rates, sizeof(supported_link_rates));
+	while (true) {
+		if (retry_dpcd_writes &&
+		    !dp_prepare_sink_for_link_training(link, 1)) {
+			status = DC_ERROR_UNEXPECTED;
+			goto dpcd_write_retry;
 		}
-		status = core_link_write_dpcd(link, DP_LINK_BW_SET, &rate, 1);
-		if (status != DC_OK)
-			DC_LOG_ERROR("%s:%d: core_link_write_dpcd (DP_LINK_BW_SET) failed\n", __func__, __LINE__);
 
-		status = core_link_write_dpcd(link, DP_LINK_RATE_SET,
-				&lt_settings->link_settings.link_rate_set, 1);
-		if (status != DC_OK)
-			DC_LOG_ERROR("%s:%d: core_link_write_dpcd (DP_LINK_RATE_SET) failed\n", __func__, __LINE__);
-	} else {
-		rate = get_dpcd_link_rate(&lt_settings->link_settings);
+		rate_status = DC_OK;
 
-		status = core_link_write_dpcd(link, DP_LINK_BW_SET, &rate, 1);
+		ds_status = core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
+			&downspread.raw, sizeof(downspread));
+		status = ds_status;
 		if (status != DC_OK)
-			DC_LOG_ERROR("%s:%d: core_link_write_dpcd (DP_LINK_BW_SET) failed\n", __func__, __LINE__);
+			DC_LOG_ERROR("%s:%d: core_link_write_dpcd (DP_DOWNSPREAD_CTRL) failed\n", __func__, __LINE__);
+
+		lc_status = core_link_write_dpcd(link, DP_LANE_COUNT_SET,
+			&lane_count_set.raw, 1);
+		status = lc_status;
+		if (status != DC_OK)
+			DC_LOG_ERROR("%s:%d: core_link_write_dpcd (DP_LANE_COUNT_SET) failed\n", __func__, __LINE__);
+
+		if (link->dpcd_caps.dpcd_rev.raw >= DPCD_REV_13 &&
+				lt_settings->link_settings.use_link_rate_set == true) {
+			rate = 0;
+			/* WA for some MUX chips that will power down with eDP and lose supported
+			 * link rate set for eDP 1.4. Source reads DPCD 0x010 again to ensure
+			 * MUX chip gets link rate set back before link training.
+			 */
+			if (link->connector_signal == SIGNAL_TYPE_EDP) {
+				uint8_t supported_link_rates[16] = {0};
+
+				core_link_read_dpcd(link, DP_SUPPORTED_LINK_RATES,
+						supported_link_rates, sizeof(supported_link_rates));
+			}
+			bw_status = core_link_write_dpcd(link, DP_LINK_BW_SET, &rate, 1);
+			status = bw_status;
+			if (status != DC_OK)
+				DC_LOG_ERROR("%s:%d: core_link_write_dpcd (DP_LINK_BW_SET) failed\n", __func__, __LINE__);
+
+			status = core_link_write_dpcd(link, DP_LINK_RATE_SET,
+					&lt_settings->link_settings.link_rate_set, 1);
+			rate_status = status;
+			if (status != DC_OK)
+				DC_LOG_ERROR("%s:%d: core_link_write_dpcd (DP_LINK_RATE_SET) failed\n", __func__, __LINE__);
+		} else {
+			rate = get_dpcd_link_rate(&lt_settings->link_settings);
+
+			bw_status = core_link_write_dpcd(link, DP_LINK_BW_SET, &rate, 1);
+			status = bw_status;
+			if (status != DC_OK)
+				DC_LOG_ERROR("%s:%d: core_link_write_dpcd (DP_LINK_BW_SET) failed\n", __func__, __LINE__);
+		}
+
+		if (!retry_dpcd_writes)
+			break;
+
+		DC_LOG_INFO("APPLE5K: link-config write pass link[%u] retry=%u downspread=%d lane_count=%d bandwidth=%d rate_set=%d\n",
+			    link->link_index, retry, ds_status, lc_status,
+			    bw_status, rate_status);
+
+		if (ds_status == DC_OK && lc_status == DC_OK &&
+		    bw_status == DC_OK && rate_status == DC_OK)
+			break;
+
+dpcd_write_retry:
+		if (retry >= DP_LT_DPCD_WRITE_RETRIES)
+			break;
+
+		fsleep(DP_LT_AUX_READY_COOLDOWN_US);
+		retry++;
 	}
+
+	if (dc_link_needs_tiled_slave_root_wake(link))
+		DC_LOG_INFO("APPLE5K: link-config final link[%u] retry=%u status=%d downspread=%d lane_count=%d bandwidth=%d rate_set=%d rate_byte=0x%02x\n",
+			    link->link_index, retry, status, ds_status,
+			    lc_status, bw_status, rate_status, rate);
 
 	if (rate) {
 		DC_LOG_HW_LINK_TRAINING("%s\n %x rate = %x\n %x lane = %x framing = %x\n %x spread = %x\n",
@@ -1669,6 +1801,14 @@ bool perform_link_training_with_retries(
 			msleep(delay_dp_power_up_in_ms);
 		}
 
+		if (!dp_prepare_sink_for_link_training(link,
+						       DP_LT_AUX_READY_ATTEMPTS)) {
+			DC_LOG_WARNING("%s: DP link(%d) sink AUX not ready for training\n",
+				       __func__, link->link_index);
+			status = LINK_TRAINING_ABORT;
+			goto link_training_failed;
+		}
+
 		edp_set_panel_assr(link, pipe_ctx, &panel_mode, true);
 
 		dp_set_panel_mode(link, panel_mode);
@@ -1719,6 +1859,7 @@ bool perform_link_training_with_retries(
 			}
 		}
 
+link_training_failed:
 		fail_count++;
 		dp_trace_lt_fail_count_update(link, fail_count, false);
 		if (link->ep_type == DISPLAY_ENDPOINT_PHY) {
@@ -1813,4 +1954,3 @@ bool perform_link_training_with_retries(
 
 	return false;
 }
-
