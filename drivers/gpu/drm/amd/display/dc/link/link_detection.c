@@ -1157,6 +1157,42 @@ static bool link_detect_dac_load_detect(struct dc_link *link)
  *
  * This does not create remote sinks.
  */
+/* APPLE5K: dump the PANEL-side DPCD -- the panel's own register space, where
+ * the native-vs-compat TCON mode actually lives (the GPU MMIO diff proved the
+ * mode is NOT GPU-side). Called at the very top of detect, BEFORE the first
+ * 0x4F1 write / link retrain, so on an OCLP boot the FIRST call captures the
+ * firmware-set NATIVE panel state. Diff that against the COMPAT state (read via
+ * /dev/drm_dp_aux once the desktop is up, or a later detect) to reveal the
+ * register the Apple firmware writes to flip the panel. DPCD reads are AUX
+ * transactions: a bad address just NACKs (status!=0), no hang. */
+static void apple5k_dump_panel_dpcd(struct dc_link *link, const char *stage)
+{
+	static const uint32_t blocks[] = {
+		0x000, 0x010, 0x080, 0x090, 0x0a0, 0x0b0,
+		0x100, 0x110, 0x200, 0x210,
+		0x300, 0x310, 0x320,
+		0x400, 0x410, 0x420, 0x430, 0x440, 0x450, 0x460, 0x470,
+		0x480, 0x490, 0x4a0, 0x4b0, 0x4c0, 0x4d0, 0x4e0, 0x4f0,
+		0x500, 0x510,
+		0x700, 0x710, 0x720, 0x730,
+	};
+	uint8_t buf[16];
+	char line[64];
+	unsigned int i, j, p;
+	enum dc_status s;
+
+	DC_LOGGER_INIT(link->ctx->logger);
+	for (i = 0; i < ARRAY_SIZE(blocks); i++) {
+		memset(buf, 0, sizeof(buf));
+		s = core_link_read_dpcd(link, blocks[i], buf, sizeof(buf));
+		p = 0;
+		for (j = 0; j < sizeof(buf); j++)
+			p += scnprintf(line + p, sizeof(line) - p, "%02x ", buf[j]);
+		DC_LOG_INFO("APPLE5K-DPCD stage=%s link[%u] %03x: %sstatus=%d\n",
+			    stage, link->link_index, blocks[i], line, s);
+	}
+}
+
 static bool detect_link_and_local_sink(struct dc_link *link,
 				  enum dc_detect_reason reason)
 {
@@ -1176,6 +1212,13 @@ static bool detect_link_and_local_sink(struct dc_link *link,
 	const uint32_t post_oui_delay = 30; // 30ms
 
 	DC_LOGGER_INIT(link->ctx->logger);
+
+	/* APPLE5K: capture the panel DPCD BEFORE any 0x4F1/retrain. On an OCLP
+	 * boot the first call here sees the firmware-NATIVE panel; later this is
+	 * the COMPAT panel -- diff the two to find the firmware's set-native reg. */
+	if (dc_link_has_tiled_root_panel_patch(link) ||
+	    dc_link_has_tiled_slave_panel_patch(link))
+		apple5k_dump_panel_dpcd(link, "detect-pre");
 
 	if (dc_is_virtual_signal(link->connector_signal))
 		return false;
