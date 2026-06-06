@@ -1215,8 +1215,13 @@ static bool detect_link_and_local_sink(struct dc_link *link,
 
 	/* APPLE5K: capture the panel DPCD BEFORE any 0x4F1/retrain. On an OCLP
 	 * boot the first call here sees the firmware-NATIVE panel; later this is
-	 * the COMPAT panel -- diff the two to find the firmware's set-native reg. */
-	if (dc_link_has_tiled_root_panel_patch(link) ||
+	 * the COMPAT panel -- diff the two to find the firmware's set-native reg.
+	 * Gate on EDP too: the tiled-ROOT identity isn't set until the EDID read
+	 * later in this function, so dc_link_has_tiled_root_panel_patch() is still
+	 * false here -- but the root IS the internal eDP, and it's the link whose
+	 * 0x4F1 latch / mode register we most need. */
+	if (link->connector_signal == SIGNAL_TYPE_EDP ||
+	    dc_link_has_tiled_root_panel_patch(link) ||
 	    dc_link_has_tiled_slave_panel_patch(link))
 		apple5k_dump_panel_dpcd(link, "detect-pre");
 
