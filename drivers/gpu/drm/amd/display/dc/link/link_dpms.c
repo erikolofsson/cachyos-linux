@@ -155,6 +155,17 @@ void link_blank_all_dp_displays(struct dc *dc)
 			(dc->links[i]->priv == NULL) || (dc->links[i]->local_sink == NULL))
 			continue;
 
+#if APPLE5K_SKIP_TILED_BOOT_BLANK
+		/* APPLE5K: skip ALL boot-cleanup link touches for the tiled slave --
+		 * dp_retrieve_lttpr_cap() writes DP_PHY_REPEATER_MODE and re-latches the
+		 * firmware-native panel to compat. Preserve the firmware state. */
+		if (dc_link_has_tiled_root_panel_patch(dc->links[i]) ||
+		    dc_link_has_tiled_slave_panel_patch(dc->links[i])) {
+			apple5k_probe_mode(dc->links[i], "boot-cleanup-skip-dp");
+			continue;
+		}
+#endif
+
 		/* DP 2.0 spec requires that we read LTTPR caps first */
 		dp_retrieve_lttpr_cap(dc->links[i]);
 		/* if any of the displays are lit up turn them off */
@@ -177,6 +188,15 @@ void link_blank_all_edp_displays(struct dc *dc)
 		if ((dc->links[i]->connector_signal != SIGNAL_TYPE_EDP) ||
 			(!dc->links[i]->edp_sink_present))
 			continue;
+
+#if APPLE5K_SKIP_TILED_BOOT_BLANK
+		/* APPLE5K: preserve the firmware-native tiled root -- skip boot cleanup. */
+		if (dc_link_has_tiled_root_panel_patch(dc->links[i]) ||
+		    dc_link_has_tiled_slave_panel_patch(dc->links[i])) {
+			apple5k_probe_mode(dc->links[i], "boot-cleanup-skip-edp");
+			continue;
+		}
+#endif
 
 		/* if any of the displays are lit up turn them off */
 		status = core_link_read_dpcd(dc->links[i], DP_SET_POWER,
