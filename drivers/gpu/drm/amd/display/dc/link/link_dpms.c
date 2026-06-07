@@ -2387,6 +2387,8 @@ void link_set_dpms_off(struct pipe_ctx *pipe_ctx)
 
 	DC_LOGGER_INIT(pipe_ctx->stream->ctx->logger);
 
+	apple5k_probe_mode(link, "dpms-off-entry");
+
 	ASSERT(is_master_pipe_for_link(link, pipe_ctx));
 
 	if (dp_is_128b_132b_signal(pipe_ctx))
@@ -2502,6 +2504,8 @@ void link_set_dpms_on(
 		pipe_ctx->stream->apply_edp_fast_boot_optimization;
 
 	DC_LOGGER_INIT(pipe_ctx->stream->ctx->logger);
+
+	apple5k_probe_mode(link, "dpms-on-entry");
 
 	ASSERT(is_master_pipe_for_link(link, pipe_ctx));
 

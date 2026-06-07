@@ -148,6 +148,71 @@ static enum dc_status tiled_root_write_panel_wake(struct dc_link *link,
 	return status;
 }
 
+/*
+ * APPLE5K read-only mode probe: read the ROOT panel's mode triplet
+ * (0x41C/0x425/0x4F1) from any tiled link and log it. Used to bisect exactly
+ * which driver action flips the panel native->compat (panel boots native; some
+ * action between root-detect and slave-detect knocks it down). 0x425 bit1 set =
+ * COMPAT, clear = NATIVE. AUX reads are NACK-safe; never writes.
+ */
+void apple5k_probe_mode(struct dc_link *link, const char *tag)
+{
+	struct dc_link *root = NULL;
+	uint8_t r41c = 0, r425 = 0, r4f1 = 0;
+
+	if (!link)
+		return;
+	if (dc_link_has_tiled_root_panel_patch(link))
+		root = link;
+	else if (link->tiled_peer &&
+		 dc_link_has_tiled_root_panel_patch(link->tiled_peer))
+		root = link->tiled_peer;
+	if (!root)
+		return;
+
+	core_link_read_dpcd(root, 0x41C, &r41c, 1);
+	core_link_read_dpcd(root, 0x425, &r425, 1);
+	core_link_read_dpcd(root, 0x4F1, &r4f1, 1);
+	DC_LOG_INFO("APPLE5K-PROBE %s: link[%u] root[%u] 0x41C=0x%02x 0x425=0x%02x 0x4F1=0x%02x %s\n",
+		    tag ? tag : "?", link->link_index, root->link_index,
+		    r41c, r425, r4f1,
+		    (r425 & 0x02) ? "COMPAT" : "NATIVE");
+}
+
+/*
+ * APPLE5K: write the Apple source OUI to the root panel's DPCD 0x300, then read
+ * back + log the mode (experiment: does presenting an Apple source keep/restore
+ * native through amdgpu's blank+retrain?). Resolves the root from any tiled link.
+ * 0x300 source-OUI write only -- never the 0x4F1 latch.
+ */
+void apple5k_write_src_oui(struct dc_link *link, const char *tag)
+{
+#if APPLE5K_WRITE_SRC_OUI
+	static const uint8_t oui[12] = {
+		0x00, 0x10, 0xFA, 0x41, 0x41, 0x50, 0x4C, 0x00,
+		0x00, 0x01, 0x01, 0x00,
+	};
+	struct dc_link *root = NULL;
+	uint8_t rb[12] = {0};
+
+	if (!link)
+		return;
+	if (dc_link_has_tiled_root_panel_patch(link))
+		root = link;
+	else if (link->tiled_peer &&
+		 dc_link_has_tiled_root_panel_patch(link->tiled_peer))
+		root = link->tiled_peer;
+	if (!root)
+		return;
+
+	core_link_write_dpcd(root, 0x300, oui, sizeof(oui));
+	core_link_read_dpcd(root, 0x300, rb, sizeof(rb));
+	DC_LOG_INFO("APPLE5K-OUI %s: root[%u] wrote src OUI, readback 0x300=%*ph\n",
+		    tag ? tag : "?", root->link_index, (int)sizeof(rb), rb);
+	apple5k_probe_mode(link, tag);
+#endif
+}
+
 static bool tiled_slave_poll_aux(struct dc_link *link,
 				 struct dc_link *root_link,
 				 const char *stage,
@@ -1238,8 +1303,11 @@ static bool detect_link_and_local_sink(struct dc_link *link,
 	 * 0x4F1 latch / mode register we most need. */
 	if (link->connector_signal == SIGNAL_TYPE_EDP ||
 	    dc_link_has_tiled_root_panel_patch(link) ||
-	    dc_link_has_tiled_slave_panel_patch(link))
+	    dc_link_has_tiled_slave_panel_patch(link)) {
 		apple5k_dump_panel_dpcd(link, "detect-pre");
+		apple5k_probe_mode(link, "detect-enter");
+		apple5k_write_src_oui(link, "detect-oui");
+	}
 
 	if (dc_is_virtual_signal(link->connector_signal))
 		return false;

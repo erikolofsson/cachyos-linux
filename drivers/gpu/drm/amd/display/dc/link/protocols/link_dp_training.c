@@ -1694,6 +1694,9 @@ enum link_training_result dp_perform_link_training(
 	enum dp_link_encoding encoding =
 			link_dp_get_encoding_format(link_settings);
 
+	apple5k_probe_mode(link, "LT-entry");
+	apple5k_write_src_oui(link, "LT-oui");
+
 	/* decide training settings */
 	dp_decide_training_settings(
 			link,
@@ -1744,6 +1747,7 @@ enum link_training_result dp_perform_link_training(
 	dp_log_training_result(link, &lt_settings, status);
 	if (status != LINK_TRAINING_SUCCESS)
 		link->ctx->dc->debug_data.ltFailCount++;
+	apple5k_probe_mode(link, "LT-exit");
 	return status;
 }
 

@@ -59,4 +59,21 @@ enum dc_status core_link_write_dpcd(
  */
 enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link);
 
+/*
+ * APPLE5K read-only probe: log the root panel's mode triplet (0x41C/0x425/0x4F1)
+ * from any tiled link, to bisect which driver action flips it native->compat.
+ */
+void apple5k_probe_mode(struct dc_link *link, const char *tag);
+
+/*
+ * APPLE5K experiment: write the Apple *source* OUI (00:10:FA "AAPL" ...) to the
+ * root panel DPCD 0x300, mirroring macOS AuxChannelProxy::initializeAppleOUI.
+ * Hypothesis: the panel TCON keeps/enters native only when it sees an Apple
+ * source OUI; presenting it before amdgpu blanks/retrains the firmware-native
+ * display may stop the native->compat flip. This is a 0x300 source-OUI write
+ * only (NOT the 0x4F1 latch), so it does not hard-wedge the panel.
+ */
+#define APPLE5K_WRITE_SRC_OUI 1
+void apple5k_write_src_oui(struct dc_link *link, const char *tag);
+
 #endif
