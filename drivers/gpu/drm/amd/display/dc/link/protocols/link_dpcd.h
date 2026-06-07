@@ -86,4 +86,15 @@ void apple5k_write_src_oui(struct dc_link *link, const char *tag);
  */
 #define APPLE5K_SKIP_TILED_BOOT_BLANK 1
 
+/*
+ * APPLE5K experiment: the tiled SLAVE (link[1], a separate DP stream not covered
+ * by eDP fast boot) is the last native->compat flip -- its modeset AUX link
+ * retrain re-latches the panel TCON to compat (LT-entry NATIVE -> LT-exit
+ * COMPAT). The slave is already firmware-trained (boot power-down skipped), so
+ * set to 1 to use the no-AUX-handshake path (dp_perform_link_training_skip_aux)
+ * for the tiled slave: program the PHY to the known settings without retraining,
+ * preserving the firmware-native panel.
+ */
+#define APPLE5K_SKIP_TILED_SLAVE_RETRAIN 1
+
 #endif
