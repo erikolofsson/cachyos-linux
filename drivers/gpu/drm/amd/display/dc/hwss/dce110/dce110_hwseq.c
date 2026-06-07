@@ -2003,6 +2003,20 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
 			    edp_streams[0]->link->link_index);
 	}
 
+	/* APPLE5K: the tiled SLAVE is a DP stream, so eDP fast boot doesn't cover it
+	 * and link_set_dpms_on would run the full link-enable (dp_enable_link_phy +
+	 * dp_prepare_sink + retrain) -- any of which re-latches the panel to compat.
+	 * Flag the slave stream for seamless boot so link_set_dpms_on early-returns
+	 * (skips the entire link-enable). Both tiles then adopt the firmware-native
+	 * state with no link disruption. */
+	for (i = 0; i < context->stream_count; i++) {
+		if (dc_link_has_tiled_slave_panel_patch(context->streams[i]->link)) {
+			context->streams[i]->apply_seamless_boot_optimization = true;
+			DC_LOG_INFO("APPLE5K: seamless boot for tiled slave stream link[%u]\n",
+				    context->streams[i]->link->link_index);
+		}
+	}
+
 	// Check seamless boot support
 	for (i = 0; i < context->stream_count; i++) {
 		if (context->streams[i]->apply_seamless_boot_optimization) {
