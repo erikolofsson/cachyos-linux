@@ -193,6 +193,18 @@ void link_blank_dp_stream(struct dc_link *link, bool hw_init)
 	struct dc  *dc = link->ctx->dc;
 	enum signal_type signal = link->connector_signal;
 
+#if APPLE5K_SKIP_TILED_BOOT_BLANK
+	/* APPLE5K: preserve the firmware-handed-off native 5K display -- do NOT
+	 * blank/power-down the tiled root/slave streams during boot cleanup, since
+	 * that resets the latched panel TCON to compat (the soft native->compat
+	 * flip). Runtime display-off goes through dce110_blank_stream, not here. */
+	if (dc_link_has_tiled_root_panel_patch(link) ||
+	    dc_link_has_tiled_slave_panel_patch(link)) {
+		apple5k_probe_mode(link, "boot-blank-SKIP");
+		return;
+	}
+#endif
+
 	if ((signal == SIGNAL_TYPE_EDP) ||
 		(signal == SIGNAL_TYPE_DISPLAY_PORT)) {
 		if (link->ep_type == DISPLAY_ENDPOINT_PHY &&

@@ -73,7 +73,17 @@ void apple5k_probe_mode(struct dc_link *link, const char *tag);
  * display may stop the native->compat flip. This is a 0x300 source-OUI write
  * only (NOT the 0x4F1 latch), so it does not hard-wedge the panel.
  */
-#define APPLE5K_WRITE_SRC_OUI 1
+#define APPLE5K_WRITE_SRC_OUI 0	/* disproven: source OUI does not gate panel mode */
 void apple5k_write_src_oui(struct dc_link *link, const char *tag);
+
+/*
+ * APPLE5K experiment: the firmware hands off a LIVE native 5K display (both
+ * tiles scanning out). amdgpu's boot cleanup (link_blank_dp_stream via
+ * link_blank_all_{e}dp_displays) blanks + powers down those firmware streams,
+ * which resets the latched panel TCON to compat (the soft flip). Set to 1 to
+ * SKIP that boot blank/power-down for the tiled links and preserve the
+ * firmware-native state. Runtime display-off (dce110_blank_stream) is unaffected.
+ */
+#define APPLE5K_SKIP_TILED_BOOT_BLANK 1
 
 #endif
