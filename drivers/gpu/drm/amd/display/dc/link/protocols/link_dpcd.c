@@ -255,11 +255,24 @@ enum dc_status core_link_write_dpcd(
 
 enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
 {
-	uint8_t payload = 1;
+	uint8_t b;
+	enum dc_status s;
 
 	if (!dc_link_has_tiled_root_panel_patch(root_link))
 		return DC_OK;
 
-	return core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
-				    &payload, sizeof(payload));
+	/* APPLE5K: write the firmware-NATIVE panel-mode triplet, found by diffing
+	 * the OCLP-native vs compat ROOT DPCD at detect-pre (before Linux writes
+	 * anything):
+	 *     0x41C = 0x15  (native; compat 0x05 -> native sets bit4)
+	 *     0x425 = 0x00  (native; compat 0x02 -> native clears bit1)
+	 *     0x4F1 = 0x01  (native; compat 0x00 -> the panel latch)
+	 * Writing 0x4F1=1 alone only latches the *current* (compat) mode -- the
+	 * mode itself lives in 0x41C/0x425. Set the mode regs first, then latch.
+	 * (Readback logging is done by the caller tiled_root_write_panel_wake().) */
+	b = 0x15; core_link_write_dpcd(root_link, 0x41C, &b, 1);
+	b = 0x00; core_link_write_dpcd(root_link, 0x425, &b, 1);
+	b = 0x01; s = core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
+					   &b, 1);
+	return s;
 }

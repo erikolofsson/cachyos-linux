@@ -129,6 +129,20 @@ static enum dc_status tiled_root_write_panel_wake(struct dc_link *link,
 		    slave_link ? (int)slave_link->link_index : -1,
 		    status, link->aux_mode);
 
+	/* APPLE5K: read back the native-mode triplet just written by the pulse so
+	 * we can tell whether 0x41C/0x425/0x4F1 are writable control (readback ==
+	 * 15/00/01) or read-only status (reverts to 05/02/00). */
+	{
+		uint8_t r41c = 0, r425 = 0, r4f1 = 0;
+
+		core_link_read_dpcd(link, 0x41C, &r41c, 1);
+		core_link_read_dpcd(link, 0x425, &r425, 1);
+		core_link_read_dpcd(link, 0x4F1, &r4f1, 1);
+		DC_LOG_INFO("APPLE5K: native triplet stage=%s root_link[%u] readback 0x41C=0x%02x 0x425=0x%02x 0x4F1=0x%02x\n",
+			    stage ? stage : "unknown", link->link_index,
+			    r41c, r425, r4f1);
+	}
+
 	return status;
 }
 
