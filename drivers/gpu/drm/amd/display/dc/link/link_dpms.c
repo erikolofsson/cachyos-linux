@@ -89,6 +89,7 @@ static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 
 	DC_LOGGER_INIT(link->ctx->logger);
 
+#if APPLE5K_PANEL_DPCD_WRITES
 	status = core_link_write_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
 				      &payload, sizeof(payload));
 	read_status = core_link_read_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
@@ -96,6 +97,15 @@ static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 	DC_LOG_INFO("APPLE5K: stream-enable latch 0x4F1 link[%u] status=%d value=0x%02x read_status=%d readback=0x%02x sink=%p\n",
 		    link->link_index, status, payload, read_status, readback,
 		    link->local_sink);
+#else
+	/* APPLE5K NON-DESTRUCTIVE experiment: do NOT write the panel latch. */
+	(void)payload;
+	(void)readback;
+	(void)status;
+	(void)read_status;
+	DC_LOG_INFO("APPLE5K: stream-enable latch 0x4F1 SKIPPED (non-destructive experiment) link[%u] sink=%p\n",
+		    link->link_index, link->local_sink);
+#endif
 }
 
 /*

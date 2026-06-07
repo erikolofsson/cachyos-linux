@@ -41,6 +41,18 @@ enum dc_status core_link_write_dpcd(
 		uint32_t size);
 
 /*
+ * APPLE5K experiment toggle. Set to 0 to build a panel-NON-DESTRUCTIVE kernel:
+ * NO DPCD writes to the Apple 5K panel (0x4F1 latch, 0x41C/0x425 mode triplet,
+ * 0x300 source-OUI). Hypothesis (per warm-boot test): our panel DPCD writes
+ * wedge the TCON so even the Apple EFI firmware can't restore native on a warm
+ * boot, whereas the vanilla kernel leaves it EFI-recoverable. With this at 0 the
+ * kernel should behave (toward the panel) like vanilla -> warm-boot into EFI
+ * should restore native if our writes are the wedge. Set to 1 for the prior
+ * write-the-latch behavior.
+ */
+#define APPLE5K_PANEL_DPCD_WRITES 0
+
+/*
  * Pulse the Apple 5K root panel-latch DPCD (0x4F1 = 1). Used by the slave-side
  * pre-detect / source-DPCD / link-training paths to wake the panel before
  * touching the slave's AUX. Safe to call with NULL or non-root link — no-op.

@@ -134,13 +134,15 @@ static enum dc_status tiled_root_write_panel_wake(struct dc_link *link,
 	 * 15/00/01) or read-only status (reverts to 05/02/00). */
 	{
 		uint8_t r41c = 0, r425 = 0, r4f1 = 0;
+		uint8_t oui[12] = {0};
 
 		core_link_read_dpcd(link, 0x41C, &r41c, 1);
 		core_link_read_dpcd(link, 0x425, &r425, 1);
 		core_link_read_dpcd(link, 0x4F1, &r4f1, 1);
-		DC_LOG_INFO("APPLE5K: native triplet stage=%s root_link[%u] readback 0x41C=0x%02x 0x425=0x%02x 0x4F1=0x%02x\n",
+		core_link_read_dpcd(link, 0x300, oui, sizeof(oui));
+		DC_LOG_INFO("APPLE5K: native triplet stage=%s root_link[%u] readback 0x41C=0x%02x 0x425=0x%02x 0x4F1=0x%02x src_oui[0x300]=%*ph\n",
 			    stage ? stage : "unknown", link->link_index,
-			    r41c, r425, r4f1);
+			    r41c, r425, r4f1, (int)sizeof(oui), oui);
 	}
 
 	return status;

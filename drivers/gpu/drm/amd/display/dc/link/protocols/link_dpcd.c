@@ -261,6 +261,7 @@ enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
 	if (!dc_link_has_tiled_root_panel_patch(root_link))
 		return DC_OK;
 
+#if APPLE5K_PANEL_DPCD_WRITES
 	/* APPLE5K: write the firmware-NATIVE panel-mode triplet, found by diffing
 	 * the OCLP-native vs compat ROOT DPCD at detect-pre (before Linux writes
 	 * anything):
@@ -275,4 +276,12 @@ enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
 	b = 0x01; s = core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
 					   &b, 1);
 	return s;
+#else
+	/* APPLE5K NON-DESTRUCTIVE experiment (APPLE5K_PANEL_DPCD_WRITES==0): do NOT
+	 * write the panel latch/mode in compat. Testing whether our DPCD writes are
+	 * what wedge the TCON so EFI can't restore native on a warm boot. */
+	(void)b;
+	(void)s;
+	return DC_OK;
+#endif
 }
