@@ -1751,6 +1751,19 @@ struct dc_scratch_space {
 	 * panel-patch.
 	 */
 	struct dc_link *tiled_peer;
+	/*
+	 * APPLE5K: the iMac Pro's EFI hands off a NATIVE-trained 5K tiled panel.
+	 * apple5k_imac_pro is set (DMI iMacPro1,1) at EDID-parse time. The panel
+	 * mode (DPCD 0x425) is sampled once at the first root latch pulse, before
+	 * amdgpu touches the panel. The preservation logic (boot fast-boot,
+	 * keep-stream-on-blank, slave skip-retrain, backlight) is enabled ONLY on
+	 * the iMac Pro AND only when the panel actually booted native -- this keeps
+	 * every other iMac model on its existing path (a compat boot, or any other
+	 * machine, has nothing to preserve).
+	 */
+	bool apple5k_imac_pro;
+	bool apple5k_native_boot;
+	bool apple5k_native_sampled;
 };
 
 struct dc {
@@ -2726,6 +2739,27 @@ static inline bool dc_link_has_tiled_slave_panel_patch(const struct dc_link *lin
 	return dc_link_has_tiled_root_panel_patch(link->tiled_peer);
 }
 
+/*
+ * APPLE5K: true when @link is part of the tiled panel AND that panel booted in
+ * native mode (the EFI-trained state we preserve). Resolves the root from a
+ * root or slave link and checks the once-sampled apple5k_native_boot flag. This
+ * gates all the preservation paths (boot fast-boot, keep-stream-on-blank, slave
+ * skip-retrain, backlight) so they are inert on a compat boot or non-tiled link.
+ * NOTE: NOT for the detection paths (latch pulse / EDID reread) -- those run
+ * before native is sampled and must use dc_link_has_tiled_*_panel_patch().
+ */
+static inline bool dc_link_apple5k_preserve(const struct dc_link *link)
+{
+	const struct dc_link *root = NULL;
+
+	if (dc_link_has_tiled_root_panel_patch(link))
+		root = link;
+	else if (link && dc_link_has_tiled_root_panel_patch(link->tiled_peer))
+		root = link->tiled_peer;
+
+	return root && root->apple5k_imac_pro && root->apple5k_native_boot;
+}
+
 static inline bool dc_link_needs_tiled_slave_root_wake(const struct dc_link *link)
 {
 	const struct dc_panel_patch *patch;
@@ -2739,6 +2773,18 @@ static inline bool dc_link_needs_tiled_slave_root_wake(const struct dc_link *lin
 
 	return dc_link_has_tiled_root_panel_patch(link->tiled_peer);
 }
+
+/*
+ * APPLE5K: standard eDP display-off subset for the tiled panel WITHOUT the
+ * TCON-flipping ops. The amdgpu_dm keep-stream gates hold the pipe/OTG/link up
+ * across a CRTC-off (native preserved), so the normal blank/teardown never runs
+ * and the backlight is left on. This runs the same eDP-safe bits the standard
+ * dce110_blank_stream() does -- ABM disable + panel backlight off -- but NOT the
+ * dp_blank that re-latches the panel TCON to compat. Mirrors macOS doDoze()
+ * (keep driving the LCD, kill the backlight only). off=true on CRTC-off;
+ * off=false restores the backlight on wake. Caller must hold dc_lock.
+ */
+void dc_apple5k_tiled_panel_blank(struct dc *dc, struct dc_link *root_link, bool off);
 
 static inline bool dc_link_needs_pre_training_aux_ready(const struct dc_link *link)
 {

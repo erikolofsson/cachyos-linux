@@ -28,6 +28,7 @@
 
 #include <linux/string.h>
 #include <linux/acpi.h>
+#include <linux/dmi.h>
 #include <linux/i2c.h>
 
 #include <drm/drm_atomic.h>
@@ -247,13 +248,29 @@ static void apply_edid_quirks(struct drm_device *dev,
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE26):
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE31):
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE32):
+		/*
+		 * APPLE5K: the EFI-trained-native preservation (boot fast-boot,
+		 * keep-stream-on-blank, slave skip-retrain, backlight) is enabled ONLY
+		 * on the iMac Pro, where it was developed and tested. Every other iMac
+		 * model keeps its existing tiled-detection path untouched; this just
+		 * tags the link so dc_link_apple5k_preserve() gates the new logic.
+		 */
+		if (link && dmi_match(DMI_PRODUCT_NAME, "iMacPro1,1"))
+			link->apple5k_imac_pro = true;
 		if (connector_signal == SIGNAL_TYPE_EDP) {
 			edid_caps->panel_patch.tiled_root_force_edid_reread = 1;
 			edid_caps->panel_patch.prefer_tile_native_mode = 1;
 		} else if (connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
 			edid_caps->panel_patch.tiled_slave_root_wake = 1;
 			edid_caps->panel_patch.tiled_slave_source_table_rev = 1;
-			edid_caps->panel_patch.tiled_stream_enable_latch = 1;
+			/*
+			 * The stream-enable 0x4F1 re-pulse is the slave bring-up mechanism
+			 * for the other tiled iMac models. The iMac Pro instead preserves
+			 * the EFI-trained-native panel by NEVER touching it, so disable the
+			 * latch there (any 0x4F1 write can re-latch/wedge the TCON).
+			 */
+			edid_caps->panel_patch.tiled_stream_enable_latch =
+				link && link->apple5k_imac_pro ? 0 : 1;
 			edid_caps->panel_patch.aux_ready_before_link_training = 1;
 			edid_caps->panel_patch.prefer_tile_native_mode = 1;
 		}
