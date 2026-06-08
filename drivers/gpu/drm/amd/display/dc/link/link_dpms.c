@@ -126,6 +126,12 @@ void link_blank_all_dp_displays(struct dc *dc)
 			(dc->links[i]->priv == NULL) || (dc->links[i]->local_sink == NULL))
 			continue;
 
+		/* APPLE5K: skip ALL boot-cleanup link touches for the iMac Pro's native
+		 * tiled panel -- dp_retrieve_lttpr_cap() writes DP_PHY_REPEATER_MODE and
+		 * re-latches the firmware-native panel to compat. Preserve it. */
+		if (dc_link_apple5k_preserve(dc->links[i]))
+			continue;
+
 		/* DP 2.0 spec requires that we read LTTPR caps first */
 		dp_retrieve_lttpr_cap(dc->links[i]);
 		/* if any of the displays are lit up turn them off */
@@ -149,6 +155,11 @@ void link_blank_all_edp_displays(struct dc *dc)
 			(!dc->links[i]->edp_sink_present))
 			continue;
 
+		/* APPLE5K: preserve the iMac Pro's firmware-native tiled root -- skip
+		 * boot cleanup so it isn't re-latched to compat. */
+		if (dc_link_apple5k_preserve(dc->links[i]))
+			continue;
+
 		/* if any of the displays are lit up turn them off */
 		status = core_link_read_dpcd(dc->links[i], DP_SET_POWER,
 							&dpcd_power_state, sizeof(dpcd_power_state));
@@ -163,6 +174,13 @@ void link_blank_dp_stream(struct dc_link *link, bool hw_init)
 	unsigned int j;
 	struct dc  *dc = link->ctx->dc;
 	enum signal_type signal = link->connector_signal;
+
+	/* APPLE5K: preserve the iMac Pro's firmware-handed-off native 5K display --
+	 * do NOT blank/power-down the tiled root/slave streams during boot cleanup,
+	 * since that resets the latched panel TCON to compat. Runtime display-off
+	 * goes through dce110_blank_stream, not here. */
+	if (dc_link_apple5k_preserve(link))
+		return;
 
 	if ((signal == SIGNAL_TYPE_EDP) ||
 		(signal == SIGNAL_TYPE_DISPLAY_PORT)) {
@@ -228,6 +246,32 @@ void link_resume(struct dc_link *link)
 {
 	if (link->connector_signal != SIGNAL_TYPE_VIRTUAL)
 		program_hpd_filter(link);
+}
+
+void dc_apple5k_tiled_panel_blank(struct dc *dc, struct dc_link *root_link, bool off)
+{
+	bool was_on;
+
+	if (!dc_link_has_tiled_root_panel_patch(root_link) ||
+	    !dc->hwss.edp_backlight_control)
+		return;
+
+	DC_LOGGER_INIT(dc->ctx->logger);
+
+	was_on = root_link->panel_cntl &&
+		 root_link->panel_cntl->funcs->is_panel_backlight_on &&
+		 root_link->panel_cntl->funcs->is_panel_backlight_on(root_link->panel_cntl);
+
+	/* off: disable the backlight (BL_PWM_EN off) -- darkens the panel while the
+	 * pipe/OTG/link stay up (keep-stream gates) so the TCON keeps its native
+	 * latch, like macOS doDoze(). on: re-enable on wake -- the keep-stream
+	 * display-off turned BL_PWM_EN off and the standard unblank path does not
+	 * reach the root's edp_backlight_control(true), so do it explicitly here.
+	 * (edp_backlight_control no-ops if it reads the backlight already in the
+	 * target state, so calling it at boot-on is harmless.) */
+	dc->hwss.edp_backlight_control(root_link, !off);
+	DC_LOG_INFO("APPLE5K: tiled panel backlight %s link[%u] (was_on=%d)\n",
+		    off ? "OFF" : "ON", root_link->link_index, was_on);
 }
 
 /* This function returns true if the pipe is used to feed video signal directly

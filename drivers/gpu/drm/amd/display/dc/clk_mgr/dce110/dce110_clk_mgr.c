@@ -63,6 +63,8 @@ static const struct state_dependent_clocks dce110_max_clks_by_state[] = {
 /*ClocksStatePerformance*/
 { .display_clk_khz = 643000, .pixel_clk_khz = 400000 } };
 
+#define APPLE5K_MIN_MEMORY_CLOCK_KHZ 536000
+
 static int determine_sclk_from_bounding_box(
 		const struct dc *dc,
 		int required_sclk)
@@ -87,6 +89,46 @@ static int determine_sclk_from_bounding_box(
 	 */
 	ASSERT(0);
 	return dc->sclk_lvls.clocks_in_khz[dc->sclk_lvls.num_levels - 1];
+}
+
+static bool dce110_clk_mgr_context_has_apple5k_preserve_stream(
+	const struct dc_state *context)
+{
+	int i;
+
+	if (!context)
+		return false;
+
+	for (i = 0; i < context->stream_count; i++)
+		if (context->streams[i] &&
+		    dc_link_apple5k_preserve(context->streams[i]->link))
+			return true;
+
+	return false;
+}
+
+static void dce110_clk_mgr_apply_apple5k_min_mclk(
+	struct dc *dc,
+	struct dc_state *context,
+	struct dm_pp_display_configuration *pp_display_cfg)
+{
+	uint32_t old_min_mem = pp_display_cfg->min_memory_clock_khz;
+
+	if (!dce110_clk_mgr_context_has_apple5k_preserve_stream(context))
+		return;
+
+	if (!dc->bw_vbios || dc->bw_vbios->memory_type != bw_def_hbm)
+		return;
+
+	pp_display_cfg->min_memory_clock_khz =
+		max(pp_display_cfg->min_memory_clock_khz,
+		    (uint32_t)APPLE5K_MIN_MEMORY_CLOCK_KHZ);
+
+	if (old_min_mem != pp_display_cfg->min_memory_clock_khz)
+		drm_info(dc->ctx->logger->dev,
+			 "APPLE5K-PP: clamp min_mem=%u->%u kHz for preserved HBM tiled scanout\n",
+			 old_min_mem,
+			 pp_display_cfg->min_memory_clock_khz);
 }
 
 uint32_t dce110_get_min_vblank_time_us(const struct dc_state *context)
@@ -228,6 +270,7 @@ void dce11_pplib_apply_display_requirements(
 		pp_display_cfg->min_memory_clock_khz = context->bw_ctx.bw.dce.yclk_khz
 			/ memory_type_multiplier;
 	}
+	dce110_clk_mgr_apply_apple5k_min_mclk(dc, context, pp_display_cfg);
 
 	pp_display_cfg->min_engine_clock_khz = determine_sclk_from_bounding_box(
 			dc,
