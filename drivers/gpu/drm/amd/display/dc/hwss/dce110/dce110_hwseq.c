@@ -1971,6 +1971,36 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
 			keep_edp_vdd_on = true;
 	}
 
+	/* APPLE5K: the firmware hands off a LIVE native 5K tiled display (both DIGs
+	 * enabled, panel TCON latched native). dc_validate_boot_timing() rejects the
+	 * tiled timing so eDP fast boot stays off and power_down_all_hw_blocks()
+	 * tears down the encoders (disable_output), which re-latches the panel to
+	 * compat -- and we have no command to put it back. Force eDP fast boot for
+	 * the tiled root so BOTH the boot power-down AND the modeset link retrain are
+	 * skipped, preserving the firmware-native panel. */
+	if (edp_stream_num &&
+	    dc_link_apple5k_preserve(edp_streams[0]->link)) {
+		can_apply_edp_fast_boot = true;
+		edp_streams[0]->apply_edp_fast_boot_optimization = true;
+		keep_edp_vdd_on = true;
+		DC_LOG_INFO("APPLE5K: force eDP fast boot for tiled root link[%u] -- skip power_down_all_hw + retrain\n",
+			    edp_streams[0]->link->link_index);
+	}
+
+	/* APPLE5K: the tiled SLAVE is a DP stream, so eDP fast boot doesn't cover it
+	 * and link_set_dpms_on would run the full link-enable (dp_enable_link_phy +
+	 * dp_prepare_sink + retrain) -- any of which re-latches the panel to compat.
+	 * Flag the slave stream for seamless boot so link_set_dpms_on early-returns
+	 * (skips the entire link-enable). Both tiles then adopt the firmware-native
+	 * state with no link disruption. */
+	for (i = 0; i < context->stream_count; i++) {
+		if (dc_link_apple5k_preserve(context->streams[i]->link)) {
+			context->streams[i]->apply_seamless_boot_optimization = true;
+			DC_LOG_INFO("APPLE5K: seamless boot for tiled slave stream link[%u]\n",
+				    context->streams[i]->link->link_index);
+		}
+	}
+
 	// Check seamless boot support
 	for (i = 0; i < context->stream_count; i++) {
 		if (context->streams[i]->apply_seamless_boot_optimization) {

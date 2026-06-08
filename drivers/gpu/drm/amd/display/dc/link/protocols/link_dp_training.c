@@ -1813,6 +1813,16 @@ bool perform_link_training_with_retries(
 
 		dp_set_panel_mode(link, panel_mode);
 
+		if (dc_link_apple5k_preserve(link)) {
+			/* APPLE5K: the tiled slave is already firmware-trained (boot
+			 * power-down was skipped). A real AUX retrain re-latches the panel
+			 * TCON to compat (the last native->compat flip). Program the PHY to
+			 * the known settings WITHOUT the AUX handshake so the firmware-native
+			 * panel is preserved. */
+			dp_perform_link_training_skip_aux(link, &pipe_ctx->link_res, &cur_link_settings);
+			return true;
+		}
+
 		if (link->aux_access_disabled) {
 			dp_perform_link_training_skip_aux(link, &pipe_ctx->link_res, &cur_link_settings);
 			return true;

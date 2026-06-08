@@ -11166,6 +11166,13 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 	u32 i;
 	struct dc_commit_streams_params params = {dc_state->streams, dc_state->stream_count};
 	bool set_backlight_level = false;
+	/* APPLE5K: tiled root eDP link whose CRTC just went inactive -- its pipe is
+	 * kept alive (keep-stream gates) so it stays native, but we still turn its
+	 * backlight off (the standard eDP display-off bits, minus the dp_blank).
+	 * apple5k_bl_on_link is the same link on the wake (active 0->1) transition,
+	 * where we must explicitly re-enable the backlight. */
+	struct dc_link *apple5k_bl_off_link = NULL;
+	struct dc_link *apple5k_bl_on_link = NULL;
 
 	/* Disable writeback */
 	for_each_old_connector_in_state(state, connector, old_con_state, i) {
@@ -11286,6 +11293,34 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 			crtc->hwmode = new_crtc_state->mode;
 			mode_set_reset_required = true;
 			set_backlight_level = true;
+			/* APPLE5K: on the tiled root's active 0->1 (wake), the keep-stream
+			 * display-off left its backlight (BL_PWM_EN) off and the normal
+			 * unblank doesn't restore it -- re-enable it explicitly after the
+			 * commit + set_backlight_level. */
+			if (!old_crtc_state->active && dm_new_crtc_state->stream &&
+			    dc_link_apple5k_preserve(dm_new_crtc_state->stream->link))
+				apple5k_bl_on_link = dm_new_crtc_state->stream->link;
+		} else if (!new_crtc_state->active &&
+			   dm_old_crtc_state->stream &&
+			   dc_link_apple5k_preserve(dm_old_crtc_state->stream->link)) {
+			/*
+			 * APPLE5K: any CRTC-off of the tiled eDP (DPMS active=0 OR a full
+			 * disable enable=0 from mutter's blank) -- the stream is kept in the
+			 * DC context by the dm_update_crtc_state gate, so DON'T reset/remove
+			 * it here (that is the modereset_required branch below, which would
+			 * dp_blank the root pipe and flip the panel to compat). The OTG/link
+			 * keep driving the LCD and the panel stays native; only the planes
+			 * drop (black). acrtc stays enabled so vblank/flip bookkeeping stays
+			 * consistent. modereset_required (= !active && needs_modeset) is true
+			 * for both cases, so this gate must sit ahead of it in the chain.
+			 */
+			DRM_INFO("APPLE5K: commit_tail keep tiled CRTC across CRTC-off (enable=%d active=%d)\n",
+				 new_crtc_state->enable, new_crtc_state->active);
+			/* On the active 1->0 transition of the tiled root eDP, turn its
+			 * backlight off after the commit (the pipe stays up = native). */
+			if (old_crtc_state->active &&
+			    dc_link_apple5k_preserve(dm_old_crtc_state->stream->link))
+				apple5k_bl_off_link = dm_old_crtc_state->stream->link;
 		} else if (modereset_required(new_crtc_state)) {
 			drm_dbg_atomic(dev,
 				       "Atomic commit: RESET. crtc id %d:[%p]\n",
@@ -11311,6 +11346,11 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 	amdgpu_dm_log_apple5k_dc_streams(dev, dc_state, "commit-after-sync");
 	mutex_lock(&dm->dc_lock);
 	dc_exit_ips_for_hw_access(dm->dc);
+	/* APPLE5K: backlight off BEFORE the commit blanks the planes (standard
+	 * order), using the still-current pipe; the pipe/OTG/link stay up so the
+	 * panel keeps its native latch -- only the backlight goes dark. */
+	if (apple5k_bl_off_link)
+		dc_apple5k_tiled_panel_blank(dm->dc, apple5k_bl_off_link, true);
 	WARN_ON(!dc_commit_streams(dm->dc, &params));
 	amdgpu_dm_log_apple5k_dc_streams(dev, dc_state, "commit-after-dc");
 
@@ -11351,6 +11391,15 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 			if (dm->backlight_dev[i])
 				amdgpu_dm_backlight_set_level(dm, i, dm->brightness[i]);
 		}
+	}
+
+	/* APPLE5K: explicitly re-enable the tiled root's backlight on wake. Done
+	 * AFTER set_backlight_level (which restores the duty) so the panel ends up
+	 * enabled at the right brightness. */
+	if (apple5k_bl_on_link) {
+		mutex_lock(&dm->dc_lock);
+		dc_apple5k_tiled_panel_blank(dm->dc, apple5k_bl_on_link, false);
+		mutex_unlock(&dm->dc_lock);
 	}
 }
 
@@ -12333,6 +12382,27 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
 
 		if (!dm_old_crtc_state->stream)
 			goto skip_modeset;
+
+		/*
+		 * APPLE5K: any CRTC-off transition of the tiled eDP must NOT remove the
+		 * stream from the DC context. mutter's "lock + esc" blank is a FULL
+		 * disable (enable=0, active=0, connectors_changed=1), NOT a DPMS
+		 * active=0 -- so the discriminator is !active (covers both). If the
+		 * root stream is removed, reset_hw_ctx_wrap dp_blank's the root pipe
+		 * (TPS1) and the panel TCON re-latches to compat, which can't be
+		 * re-natived. Keeping the stream means neither tiled pipe is dangling
+		 * or reprogrammed, so OTG + DP link keep running (only the planes drop
+		 * -> black) exactly like macOS doDoze(), and the panel stays native.
+		 * A genuine resolution change has active=1 and is unaffected (handled
+		 * by the enable-pass SET path).
+		 */
+		if (!new_crtc_state->active &&
+		    dm_old_crtc_state->stream &&
+		    dc_link_apple5k_preserve(dm_old_crtc_state->stream->link)) {
+			DRM_INFO("APPLE5K: keep tiled eDP stream in context across CRTC-off (enable=%d active=%d) -- LCD stays native\n",
+				 new_crtc_state->enable, new_crtc_state->active);
+			goto skip_modeset;
+		}
 
 		/* Unset freesync video if it was active before */
 		if (dm_old_crtc_state->freesync_config.state == VRR_STATE_ACTIVE_FIXED) {
