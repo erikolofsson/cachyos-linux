@@ -1579,6 +1579,18 @@ struct dc_scratch_space {
 };
 
 /*
+ * Role of a link within a dual-tile (two side-by-side tiles) panel pair.
+ * Wired together with dc_link.tiled_peer: the root (left) tile's connector
+ * presents the whole panel; the slave (right) tile is hidden from userspace
+ * and driven as the root crtc's peer stream when tiled stitching is enabled.
+ */
+enum dc_tiled_role {
+	DC_TILED_ROLE_NONE = 0,
+	DC_TILED_ROLE_ROOT,	/* left tile (tile_h_loc 0); presents the display */
+	DC_TILED_ROLE_SLAVE,	/* right tile (tile_h_loc 1); driven as peer stream */
+};
+
+/*
  * A link contains one or more sinks and their connected status.
  * The currently active signal type (HDMI, DP-SST, DP-MST) is also reported.
  */
@@ -1747,10 +1759,17 @@ struct dc_scratch_space {
 
 	/*
 	 * Peer link of a paired tiled panel. Set symmetrically by amdgpu_dm
-	 * at EDID-parse time so pre-sink slave paths can consult the root's
-	 * panel-patch.
+	 * for supported Apple iMac 5K internal panels at EDID-parse time so
+	 * pre-sink slave paths can consult the root's panel-patch.
 	 */
 	struct dc_link *tiled_peer;
+	/*
+	 * This link's role in the tiled pair. Populated alongside tiled_peer,
+	 * by the Apple panel-patch wiring (tiled_pair_apple = true; eDP root +
+	 * DP slave). tiled_stitch only operates on these wired Apple iMac pairs.
+	 */
+	enum dc_tiled_role tiled_role;
+	bool tiled_pair_apple;
 	/*
 	 * APPLE5K: the iMac Pro's EFI hands off a NATIVE-trained 5K tiled panel.
 	 * apple5k_imac_pro is set (DMI iMacPro1,1) at EDID-parse time. The panel

@@ -1299,6 +1299,22 @@ int amdgpu_dm_check_crtc_color_mgmt(struct dm_crtc_state *crtc,
  * Returns:
  * 0 on success. Error code if setup fails.
  */
+static void amdgpu_dm_copy_crtc_stream_color_mgmt(
+	struct dc_stream_state *dst,
+	const struct dc_stream_state *src)
+{
+	if (!dst || !src)
+		return;
+
+	dst->out_transfer_func.type = src->out_transfer_func.type;
+	dst->out_transfer_func.tf = src->out_transfer_func.tf;
+	dst->out_transfer_func.sdr_ref_white_level =
+		src->out_transfer_func.sdr_ref_white_level;
+	dst->out_transfer_func.tf_pts = src->out_transfer_func.tf_pts;
+	dst->gamut_remap_matrix = src->gamut_remap_matrix;
+	dst->csc_color_matrix = src->csc_color_matrix;
+}
+
 int amdgpu_dm_update_crtc_color_mgmt(struct dm_crtc_state *crtc)
 {
 	struct dc_stream_state *stream = crtc->stream;
@@ -1331,6 +1347,8 @@ int amdgpu_dm_update_crtc_color_mgmt(struct dm_crtc_state *crtc)
 		stream->gamut_remap_matrix.enable_remap = false;
 		stream->csc_color_matrix.enable_adjustment = false;
 	}
+
+	amdgpu_dm_copy_crtc_stream_color_mgmt(crtc->stream_peer, stream);
 
 	return 0;
 }

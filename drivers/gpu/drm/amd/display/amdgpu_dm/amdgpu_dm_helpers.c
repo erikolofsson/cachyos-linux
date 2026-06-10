@@ -125,6 +125,15 @@ static void dm_helpers_wire_tiled_peer(struct drm_device *dev,
 	if (!link->dc || (!is_root && !is_slave))
 		return;
 	if (link->tiled_peer) {
+		/* Backfill roles if a re-parse races an older wiring. */
+		if (link->tiled_role == DC_TILED_ROLE_NONE) {
+			link->tiled_role = is_root ? DC_TILED_ROLE_ROOT :
+						     DC_TILED_ROLE_SLAVE;
+			link->tiled_peer->tiled_role = is_root ?
+				DC_TILED_ROLE_SLAVE : DC_TILED_ROLE_ROOT;
+			link->tiled_pair_apple = true;
+			link->tiled_peer->tiled_pair_apple = true;
+		}
 		drm_info(dev,
 			 "APPLE5K: tiled_peer already wired link[%u] -> link[%u]\n",
 			 link->link_index, link->tiled_peer->link_index);
@@ -160,6 +169,10 @@ static void dm_helpers_wire_tiled_peer(struct drm_device *dev,
 		if (is_root && other->connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
 			link->tiled_peer = other;
 			other->tiled_peer = link;
+			link->tiled_role = DC_TILED_ROLE_ROOT;
+			other->tiled_role = DC_TILED_ROLE_SLAVE;
+			link->tiled_pair_apple = true;
+			other->tiled_pair_apple = true;
 			drm_info(dev,
 				 "APPLE5K: tiled_peer wired root link[%u] <-> dp link[%u]\n",
 				 link->link_index, other->link_index);
@@ -170,6 +183,10 @@ static void dm_helpers_wire_tiled_peer(struct drm_device *dev,
 		    other->local_sink->edid_caps.panel_patch.tiled_root_force_edid_reread) {
 			link->tiled_peer = other;
 			other->tiled_peer = link;
+			link->tiled_role = DC_TILED_ROLE_SLAVE;
+			other->tiled_role = DC_TILED_ROLE_ROOT;
+			link->tiled_pair_apple = true;
+			other->tiled_pair_apple = true;
 			drm_info(dev,
 				 "APPLE5K: tiled_peer wired slave link[%u] <-> edp link[%u]\n",
 				 link->link_index, other->link_index);
