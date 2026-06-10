@@ -266,10 +266,12 @@ enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
 	 * iMac Pro only: this is the earliest tiled-root AUX access at boot, before
 	 * amdgpu's modeset touches the panel, so sample the EFI-handed-off panel
 	 * mode (DPCD 0x425) ONCE here -- apple5k_native_boot then gates every
-	 * preservation path (dc_link_apple5k_preserve). The iMac Pro boots native
-	 * and we preserve that by NOT touching the panel, so skip the wake write;
-	 * the slave is already up. Every other iMac model keeps the original
-	 * unconditional latch write below to wake its slave tile for detection.
+	 * preservation path (dc_link_apple5k_preserve). When the iMac Pro booted
+	 * native we preserve that by NOT touching the panel (skip the wake write;
+	 * the slave is already up). A compat boot falls through to the latch
+	 * write below like every other iMac model -- per the EFI
+	 * ComplexDisplayInit RE the 0x4F1 wake is the host's arm step for the
+	 * combined dual-tile bring-up.
 	 */
 	if (root_link->apple5k_imac_pro) {
 		if (!root_link->apple5k_native_sampled) {
@@ -281,7 +283,8 @@ enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
 			root_link->apple5k_native_boot = !(mode & 0x02);
 			root_link->apple5k_native_sampled = true;
 		}
-		return DC_OK;
+		if (root_link->apple5k_native_boot)
+			return DC_OK;
 	}
 
 	return core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,

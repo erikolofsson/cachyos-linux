@@ -431,7 +431,7 @@ static void amdgpu_dm_crtc_destroy_state(struct drm_crtc *crtc,
 	if (cur->stream)
 		dc_stream_release(cur->stream);
 
-	/* apple5k single-display: release the slave-tile peer stream too. */
+	/* Tiled stitch: release the slave-tile peer stream too. */
 	if (cur->stream_peer)
 		dc_stream_release(cur->stream_peer);
 
@@ -462,7 +462,7 @@ static struct drm_crtc_state *amdgpu_dm_crtc_duplicate_state(struct drm_crtc *cr
 		dc_stream_retain(state->stream);
 	}
 
-	/* apple5k single-display: carry the slave-tile peer stream forward. */
+	/* Tiled stitch: carry the slave-tile peer stream forward. */
 	if (cur->stream_peer) {
 		state->stream_peer = cur->stream_peer;
 		dc_stream_retain(state->stream_peer);

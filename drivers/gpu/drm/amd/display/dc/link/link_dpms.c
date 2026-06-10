@@ -91,6 +91,15 @@ static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 	if (!dc_link_needs_tiled_stream_enable_latch(link) || !link->local_sink)
 		return;
 
+	/*
+	 * An EFI-native-booted iMac Pro panel must never see the 0x4F1 re-pulse
+	 * (it can re-latch the TCON out of native). 0x425 is sampled at the
+	 * first root latch pulse during link detection, which always precedes
+	 * stream enable, so preserve() is decided by now.
+	 */
+	if (dc_link_apple5k_preserve(link))
+		return;
+
 	DC_LOGGER_INIT(link->ctx->logger);
 
 	root_link = link->tiled_peer;
@@ -113,6 +122,32 @@ static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 	DC_LOG_INFO("APPLE5K: stream-enable latch 0x4F1 link[%u] status=%d value=0x%02x read_status=%d readback=0x%02x sink=%p\n",
 		    link->link_index, status, payload, read_status, readback,
 		    link->local_sink);
+}
+
+/*
+ * Find the master pipe in @state driving the other tile of @pipe_ctx's
+ * dual-tile pair (dc_link.tiled_peer), or NULL. Used to order the pair's
+ * unblanks so the panel never sees a solo tile.
+ */
+static struct pipe_ctx *get_tiled_peer_pipe(struct dc_state *state,
+					    struct pipe_ctx *pipe_ctx)
+{
+	struct dc_link *peer_link = pipe_ctx->stream->link->tiled_peer;
+	int i;
+
+	if (!peer_link ||
+	    pipe_ctx->stream->link->tiled_role == DC_TILED_ROLE_NONE)
+		return NULL;
+
+	for (i = 0; i < MAX_PIPES; i++) {
+		struct pipe_ctx *p = &state->res_ctx.pipe_ctx[i];
+
+		if (p->stream && !p->top_pipe && !p->prev_odm_pipe &&
+		    p->stream->link == peer_link && !p->stream->dpms_off)
+			return p;
+	}
+
+	return NULL;
 }
 
 void link_blank_all_dp_displays(struct dc *dc)
@@ -2512,6 +2547,7 @@ void link_set_dpms_on(
 	enum otg_out_mux_dest otg_out_dest = OUT_MUX_DIO;
 	struct vpg *vpg = pipe_ctx->stream_res.stream_enc->vpg;
 	const struct link_hwss *link_hwss = get_link_hwss(link, &pipe_ctx->link_res);
+	struct pipe_ctx *tiled_peer_pipe;
 	bool apply_edp_fast_boot_optimization =
 		pipe_ctx->stream->apply_edp_fast_boot_optimization;
 
@@ -2644,6 +2680,18 @@ void link_set_dpms_on(
 		 */
 		if (status != DC_FAIL_DP_LINK_TRAINING ||
 				pipe_ctx->stream->signal == SIGNAL_TYPE_DISPLAY_PORT_MST) {
+			/*
+			 * Don't leave a tiled-pair peer dark because this tile
+			 * failed: unblank a deferred peer now (solo lighting
+			 * beats a black panel).
+			 */
+			tiled_peer_pipe = get_tiled_peer_pipe(state, pipe_ctx);
+			if (tiled_peer_pipe &&
+			    tiled_peer_pipe->tiled_unblank_deferred) {
+				tiled_peer_pipe->tiled_unblank_deferred = false;
+				dc->hwss.unblank_stream(tiled_peer_pipe,
+					&tiled_peer_pipe->stream->link->cur_link_settings);
+			}
 			if (false == stream->link->link_status.link_active)
 				disable_link(stream->link, &pipe_ctx->link_res,
 						pipe_ctx->stream->signal);
@@ -2704,8 +2752,42 @@ void link_set_dpms_on(
 			link->is_display_mux_present)
 		msleep(20);
 
-	dc->hwss.unblank_stream(pipe_ctx,
-		&pipe_ctx->stream->link->cur_link_settings);
+	/*
+	 * Dual-tile pair: never light one tile solo. The Apple 5K TCON latches
+	 * native dual-tile mode only when both tiles first show video together
+	 * (EFI ComplexDisplayInit trains both tiles, THEN enables both); a tile
+	 * driven solo drops it to single-tile compat. If the peer tile is
+	 * enabled later in this same pass (comes after us in pipe order, link
+	 * not yet trained, and not a seamless/fast-boot pipe that skips its
+	 * unblank), defer this unblank; the peer's set_dpms_on() then unblanks
+	 * both back-to-back. dce110_apply_ctx_to_hw() unblanks any pipe left
+	 * deferred (peer enable failed or bailed early), so a miss degrades to
+	 * the old solo-lighting order instead of a dark tile. For eDP the
+	 * backlight-on rides inside unblank_stream and is deferred with it.
+	 */
+	tiled_peer_pipe = get_tiled_peer_pipe(state, pipe_ctx);
+	if (tiled_peer_pipe &&
+	    !tiled_peer_pipe->stream->link->link_status.link_active &&
+	    tiled_peer_pipe->pipe_idx > pipe_ctx->pipe_idx &&
+	    !tiled_peer_pipe->stream->apply_seamless_boot_optimization &&
+	    !tiled_peer_pipe->stream->apply_edp_fast_boot_optimization) {
+		pipe_ctx->tiled_unblank_deferred = true;
+		DC_LOG_INFO("APPLE5K: defer unblank link[%u] until tiled peer link[%u] trains (no solo tile)\n",
+			    link->link_index,
+			    tiled_peer_pipe->stream->link->link_index);
+	} else {
+		if (tiled_peer_pipe && tiled_peer_pipe->tiled_unblank_deferred) {
+			/* Second tile of the pair: light both together. */
+			tiled_peer_pipe->tiled_unblank_deferred = false;
+			dc->hwss.unblank_stream(tiled_peer_pipe,
+				&tiled_peer_pipe->stream->link->cur_link_settings);
+			DC_LOG_INFO("APPLE5K: joint unblank tiled pair link[%u] + link[%u]\n",
+				    tiled_peer_pipe->stream->link->link_index,
+				    link->link_index);
+		}
+		dc->hwss.unblank_stream(pipe_ctx,
+			&pipe_ctx->stream->link->cur_link_settings);
+	}
 
 	if (stream->sink_patches.delay_ignore_msa > 0)
 		msleep(stream->sink_patches.delay_ignore_msa);

@@ -241,6 +241,7 @@ int amdgpu_sg_display = -1; /* auto */
 int amdgpu_user_partt_mode = AMDGPU_AUTO_COMPUTE_PARTITION_MODE;
 int amdgpu_umsch_mm;
 int amdgpu_seamless = -1; /* auto */
+int amdgpu_tiled_stitch = -1; /* auto */
 uint amdgpu_debug_mask;
 int amdgpu_agp = -1; /* auto */
 int amdgpu_wbrf = -1;
@@ -1068,6 +1069,18 @@ module_param_named(modeset, amdgpu_modeset, int, 0444);
  */
 MODULE_PARM_DESC(seamless, "Seamless boot (-1 = auto (default), 0 = disable, 1 = enable)");
 module_param_named(seamless, amdgpu_seamless, int, 0444);
+
+/**
+ * DOC: tiled_stitch (int)
+ * Present a dual-tile (two side-by-side DisplayPort tiles) panel to userspace
+ * as one logical display: the root tile's connector carries a synthesized
+ * full-width preferred mode, the slave tile's connector is hidden as
+ * non-desktop, and the kernel drives both tile streams from the root crtc
+ * (splitting the framebuffer and mirroring the cursor across the tile seam).
+ */
+MODULE_PARM_DESC(tiled_stitch,
+	"Stitch dual-tile panels into one logical display (-1 = auto (Apple iMac 5K panels only, default), 0 = disable, 1 = enable for any dual-tile display)");
+module_param_named(tiled_stitch, amdgpu_tiled_stitch, int, 0444);
 
 /**
  * DOC: debug_mask (uint)

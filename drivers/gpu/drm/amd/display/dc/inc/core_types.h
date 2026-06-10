@@ -507,6 +507,13 @@ struct pipe_ctx {
 	uint32_t next_vupdate;
 	uint32_t wait_frame_count;
 	bool wait_is_required;
+	/*
+	 * Dual-tile pair (dc_link.tiled_peer): this pipe's unblank was deferred
+	 * by link_set_dpms_on() because its tile-pair peer in the same context
+	 * was not yet trained; the peer's set_dpms_on() unblanks both
+	 * back-to-back so the panel never sees a solo tile.
+	 */
+	bool tiled_unblank_deferred;
 };
 
 /* Data used for dynamic link encoder assignment.

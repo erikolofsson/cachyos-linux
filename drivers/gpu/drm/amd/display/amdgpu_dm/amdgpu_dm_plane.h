@@ -35,8 +35,8 @@ int amdgpu_dm_plane_get_cursor_position(struct drm_plane *plane, struct drm_crtc
 void amdgpu_dm_plane_handle_cursor_update(struct drm_plane *plane,
 			  struct drm_plane_state *old_plane_state);
 
-/* apple5k single-display: mirror the cursor onto the right-tile peer stream. */
-void amdgpu_dm_apple5k_program_peer_cursor(struct dc_stream_state *peer,
+/* Tiled stitch: mirror the cursor onto the right-tile peer stream. */
+void amdgpu_dm_tiled_program_peer_cursor(struct dc_stream_state *peer,
 		struct dc_cursor_attributes *attrs,
 		const struct dc_cursor_position *root_pos);
 

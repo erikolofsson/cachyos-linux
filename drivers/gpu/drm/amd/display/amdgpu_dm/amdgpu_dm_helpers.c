@@ -125,6 +125,15 @@ static void dm_helpers_wire_tiled_peer(struct drm_device *dev,
 	if (!link->dc || (!is_root && !is_slave))
 		return;
 	if (link->tiled_peer) {
+		/* Backfill roles if a re-parse races an older wiring. */
+		if (link->tiled_role == DC_TILED_ROLE_NONE) {
+			link->tiled_role = is_root ? DC_TILED_ROLE_ROOT :
+						     DC_TILED_ROLE_SLAVE;
+			link->tiled_peer->tiled_role = is_root ?
+				DC_TILED_ROLE_SLAVE : DC_TILED_ROLE_ROOT;
+			link->tiled_pair_apple = true;
+			link->tiled_peer->tiled_pair_apple = true;
+		}
 		drm_info(dev,
 			 "APPLE5K: tiled_peer already wired link[%u] -> link[%u]\n",
 			 link->link_index, link->tiled_peer->link_index);
@@ -160,6 +169,10 @@ static void dm_helpers_wire_tiled_peer(struct drm_device *dev,
 		if (is_root && other->connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
 			link->tiled_peer = other;
 			other->tiled_peer = link;
+			link->tiled_role = DC_TILED_ROLE_ROOT;
+			other->tiled_role = DC_TILED_ROLE_SLAVE;
+			link->tiled_pair_apple = true;
+			other->tiled_pair_apple = true;
 			drm_info(dev,
 				 "APPLE5K: tiled_peer wired root link[%u] <-> dp link[%u]\n",
 				 link->link_index, other->link_index);
@@ -170,6 +183,10 @@ static void dm_helpers_wire_tiled_peer(struct drm_device *dev,
 		    other->local_sink->edid_caps.panel_patch.tiled_root_force_edid_reread) {
 			link->tiled_peer = other;
 			other->tiled_peer = link;
+			link->tiled_role = DC_TILED_ROLE_SLAVE;
+			other->tiled_role = DC_TILED_ROLE_ROOT;
+			link->tiled_pair_apple = true;
+			other->tiled_pair_apple = true;
 			drm_info(dev,
 				 "APPLE5K: tiled_peer wired slave link[%u] <-> edp link[%u]\n",
 				 link->link_index, other->link_index);
@@ -265,12 +282,13 @@ static void apply_edid_quirks(struct drm_device *dev,
 			edid_caps->panel_patch.tiled_slave_source_table_rev = 1;
 			/*
 			 * The stream-enable 0x4F1 re-pulse is the slave bring-up mechanism
-			 * for the other tiled iMac models. The iMac Pro instead preserves
-			 * the EFI-trained-native panel by NEVER touching it, so disable the
-			 * latch there (any 0x4F1 write can re-latch/wedge the TCON).
+			 * for the tiled iMac models. On an iMac Pro that booted EFI-native
+			 * the panel must NEVER be touched (any 0x4F1 write can re-latch/
+			 * wedge the TCON) -- that protection is applied at consult time via
+			 * dc_link_apple5k_preserve(), so a compat-booted iMac Pro still
+			 * gets the latch chance per the EFI ComplexDisplayInit RE findings.
 			 */
-			edid_caps->panel_patch.tiled_stream_enable_latch =
-				link && link->apple5k_imac_pro ? 0 : 1;
+			edid_caps->panel_patch.tiled_stream_enable_latch = 1;
 			edid_caps->panel_patch.aux_ready_before_link_training = 1;
 			edid_caps->panel_patch.prefer_tile_native_mode = 1;
 		}

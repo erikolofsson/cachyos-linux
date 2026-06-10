@@ -1375,8 +1375,8 @@ void amdgpu_dm_plane_handle_cursor_update(struct drm_plane *plane,
 			mutex_lock(&adev->dm.dc_lock);
 			dc_stream_program_cursor_position(crtc_state->stream,
 						      &position);
-			amdgpu_dm_apple5k_program_peer_cursor(crtc_state->stream_peer,
-							      NULL, &position);
+			amdgpu_dm_tiled_program_peer_cursor(crtc_state->stream_peer,
+							    NULL, &position);
 			mutex_unlock(&adev->dm.dc_lock);
 		}
 		return;
@@ -1414,9 +1414,9 @@ void amdgpu_dm_plane_handle_cursor_update(struct drm_plane *plane,
 						   &position))
 			DRM_ERROR("DC failed to set cursor position\n");
 
-		/* apple5k: also light the cursor on the right-tile peer stream. */
-		amdgpu_dm_apple5k_program_peer_cursor(crtc_state->stream_peer,
-						      &attributes, &position);
+		/* Tiled stitch: also light the cursor on the right-tile peer stream. */
+		amdgpu_dm_tiled_program_peer_cursor(crtc_state->stream_peer,
+						    &attributes, &position);
 		mutex_unlock(&adev->dm.dc_lock);
 	}
 }
@@ -1513,7 +1513,7 @@ static struct drm_plane_state *amdgpu_dm_plane_drm_plane_duplicate_state(struct 
 		dc_plane_state_retain(dm_plane_state->dc_state);
 	}
 
-	/* apple5k single-display 5K: carry the peer (right-tile) plane forward. */
+	/* Tiled stitch: carry the peer (right-tile) plane forward. */
 	if (old_dm_plane_state->dc_state_peer) {
 		dm_plane_state->dc_state_peer = old_dm_plane_state->dc_state_peer;
 		dc_plane_state_retain(dm_plane_state->dc_state_peer);
@@ -1624,7 +1624,7 @@ static void amdgpu_dm_plane_drm_plane_destroy_state(struct drm_plane *plane,
 	if (dm_plane_state->dc_state)
 		dc_plane_state_release(dm_plane_state->dc_state);
 
-	/* apple5k single-display 5K: release the peer (right-tile) plane. */
+	/* Tiled stitch: release the peer (right-tile) plane. */
 	if (dm_plane_state->dc_state_peer)
 		dc_plane_state_release(dm_plane_state->dc_state_peer);
 

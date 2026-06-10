@@ -2561,6 +2561,23 @@ enum dc_status dce110_apply_ctx_to_hw(
 #endif
 	}
 
+	/*
+	 * Dual-tile pair safety net: unblank any pipe whose unblank was
+	 * deferred by link_set_dpms_on() waiting for its tile-pair peer, but
+	 * whose peer never reached its own unblank (enable failure or an
+	 * early-out path). Solo lighting (the old behaviour) beats leaving
+	 * the tile dark.
+	 */
+	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
+
+		if (pipe_ctx->stream && pipe_ctx->tiled_unblank_deferred) {
+			pipe_ctx->tiled_unblank_deferred = false;
+			dc->hwss.unblank_stream(pipe_ctx,
+				&pipe_ctx->stream->link->cur_link_settings);
+		}
+	}
+
 	if (dc->fbc_compressor)
 		enable_fbc(dc, dc->current_state);
 

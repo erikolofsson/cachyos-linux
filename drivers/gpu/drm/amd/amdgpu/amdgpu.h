@@ -261,6 +261,7 @@ extern int amdgpu_vcnfw_log;
 extern int amdgpu_sg_display;
 extern int amdgpu_umsch_mm;
 extern int amdgpu_seamless;
+extern int amdgpu_tiled_stitch;
 extern int amdgpu_umsch_mm_fwlog;
 
 extern int amdgpu_user_partt_mode;
