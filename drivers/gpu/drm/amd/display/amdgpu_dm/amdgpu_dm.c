@@ -155,6 +155,109 @@ MODULE_FIRMWARE(FIRMWARE_DCN_36_DMUB);
 #define FIRMWARE_DCN_401_DMUB "amdgpu/dcn_4_0_1_dmcub.bin"
 MODULE_FIRMWARE(FIRMWARE_DCN_401_DMUB);
 
+/*
+ * apple5k single-display feature gate. When set, the iMac Pro 5K dual-tile
+ * panel is presented to userspace as ONE 5120x2880 display (like macOS/EFI):
+ * one drm_crtc drives the root (left) tile via dm_crtc_state->stream and the
+ * slave (right) tile via dm_crtc_state->stream_peer, both committed together
+ * in one dc_commit_streams() so the TCON latches native. The slave's own
+ * drm_connector is hidden (non_desktop) so it never claims a second crtc.
+ * Flip to 0 to fall back to the two-connector tile-group behaviour.
+ *
+ * NB: must be defined here (top of file) because it gates code in get_modes()
+ * well above dm_update_crtc_state(); an out-of-order #define would make those
+ * #if blocks silently evaluate to 0.
+ */
+#define APPLE5K_SINGLE_DISPLAY 1
+
+/*
+ * apple5k full-5K stage. Builds on APPLE5K_SINGLE_DISPLAY: overrides the root
+ * connector EDID with the macOS "AE1F" unified identity so userspace sees one
+ * 5120x2880 display, forces both tile streams to the fixed 2560x2880 tile
+ * timing, and splits the single 5120-wide framebuffer into a left viewport
+ * (root stream) and a right viewport (peer stream) on every commit and flip.
+ * Set to 0 to fall back to the committed single-display-at-2560 behaviour.
+ */
+#define APPLE5K_SINGLE_DISPLAY_5K 1
+
+#if APPLE5K_SINGLE_DISPLAY_5K
+/*
+ * macOS unified iMac Pro 5K EDID (vendor 0x0610 "APP", product 0xAE1F, name
+ * "iMac"): base block carries no timing, a DisplayID 1.3 extension carries a
+ * single 5120x2880 detailed timing and NO tile block. Using these exact bytes
+ * makes Linux report the identical vendor/product/mode as macOS so display
+ * profiles/settings match and we don't invent a conflicting identity.
+ */
+static const u8 apple5k_ae1f_edid[256] = {
+	0x00,0xff,0xff,0xff,0xff,0xff,0xff,0x00,0x06,0x10,0x1f,0xae,0x6d,0x49,0xe6,0x99,
+	0x33,0x1a,0x01,0x04,0xb5,0x3c,0x22,0x78,0x20,0x07,0x61,0xae,0x52,0x41,0xb2,0x26,
+	0x0d,0x50,0x54,0x00,0x00,0x00,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
+	0x01,0x01,0x01,0x01,0x01,0x01,0x00,0x00,0x00,0x10,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x10,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xfc,0x00,0x69,
+	0x4d,0x61,0x63,0x0a,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x0e,
+	0x70,0x13,0x79,0x03,0x00,0x03,0x00,0x14,0x80,0x6e,0x01,0x84,0xff,0x13,0x9f,0x00,
+	0x2f,0x80,0x1f,0x00,0x3f,0x0b,0x51,0x00,0x02,0x00,0x04,0x00,0x7f,0x81,0x18,0xfa,
+	0x10,0x00,0x01,0x01,0x00,0x12,0x76,0x31,0xfc,0x78,0xfb,0xff,0x02,0x10,0x88,0x62,
+	0xd3,0xfa,0xf8,0xf8,0xfe,0xff,0xff,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xc7,0x90,
+};
+
+/* The fixed per-tile (2560x2880) timing of the iMac Pro 5K panel, captured from
+ * the live native commit (Stage 0): total 2720x2962, pixclk 483.25 MHz. */
+static void apple5k_force_tile_timing(struct dc_stream_state *stream)
+{
+	struct dc_crtc_timing *t = &stream->timing;
+
+	t->h_addressable  = 2560; t->h_total = 2720;
+	t->h_front_porch  = 48;   t->h_sync_width = 32;
+	t->h_border_left  = 0;    t->h_border_right = 0;
+	t->v_addressable  = 2880; t->v_total = 2962;
+	t->v_front_porch  = 3;    t->v_sync_width = 10;
+	t->v_border_top   = 0;    t->v_border_bottom = 0;
+	t->pix_clk_100hz  = 4832500;
+
+	/* No stream-level scaling: each 2560-wide tile maps 1:1 to its OTG. The
+	 * left/right half of the 5120 framebuffer is selected by the per-stream
+	 * plane viewport (src_rect) in the plane and flip paths. */
+	stream->src.x = 0; stream->src.y = 0;
+	stream->src.width = 2560; stream->src.height = 2880;
+	stream->dst.x = 0; stream->dst.y = 0;
+	stream->dst.width = 2560; stream->dst.height = 2880;
+}
+
+/*
+ * Point a tile plane at one half of the 5120-wide framebuffer: @src_x selects
+ * the left (0) or right (2560) viewport, and dst/clip are the full 2560x2880
+ * tile (stream space). All three rects MUST be in 2560 stream space -- leaving
+ * clip_rect at the 5120 crtc size produces an invalid pipe (grey/wedge).
+ */
+static void apple5k_set_tile_plane_rects(struct dc_plane_state *p, int src_x)
+{
+	p->src_rect.x = src_x; p->src_rect.y = 0;
+	p->src_rect.width = 2560; p->src_rect.height = 2880;
+	p->dst_rect.x = 0; p->dst_rect.y = 0;
+	p->dst_rect.width = 2560; p->dst_rect.height = 2880;
+	p->clip_rect.x = 0; p->clip_rect.y = 0;
+	p->clip_rect.width = 2560; p->clip_rect.height = 2880;
+}
+
+/* Same, for a dc_scaling_info used on the flip path. */
+static void apple5k_set_tile_scaling(struct dc_scaling_info *s, int src_x)
+{
+	s->src_rect.x = src_x; s->src_rect.y = 0;
+	s->src_rect.width = 2560; s->src_rect.height = 2880;
+	s->dst_rect.x = 0; s->dst_rect.y = 0;
+	s->dst_rect.width = 2560; s->dst_rect.height = 2880;
+	s->clip_rect.x = 0; s->clip_rect.y = 0;
+	s->clip_rect.width = 2560; s->clip_rect.height = 2880;
+}
+#endif /* APPLE5K_SINGLE_DISPLAY_5K */
+
 /**
  * DOC: overview
  *
@@ -3205,6 +3308,12 @@ static void dm_destroy_cached_state(struct amdgpu_device *adev)
 			dc_plane_state_release(dm_new_plane_state->dc_state);
 			dm_new_plane_state->dc_state = NULL;
 		}
+#if APPLE5K_SINGLE_DISPLAY_5K
+		if (dm_new_plane_state->dc_state_peer) {
+			dc_plane_state_release(dm_new_plane_state->dc_state_peer);
+			dm_new_plane_state->dc_state_peer = NULL;
+		}
+#endif
 	}
 
 	drm_atomic_helper_resume(ddev, dm->cached_state);
@@ -3938,8 +4047,25 @@ void amdgpu_dm_update_connector_after_detect(
 			}
 		} else {
 			const struct edid *edid = (const struct edid *)sink->dc_edid.raw_edid;
+			unsigned int edid_len = sink->dc_edid.length;
 
-			aconnector->drm_edid = drm_edid_alloc(edid, sink->dc_edid.length);
+#if APPLE5K_SINGLE_DISPLAY_5K
+			/*
+			 * Present the tiled root as one 5120x2880 display with the
+			 * macOS AE1F identity. The dc_sink keeps the real panel EDID
+			 * (used for the stream/link); only the userspace-visible
+			 * drm_edid is replaced, so KWin sees a single 5K panel.
+			 */
+			if (dc_link_apple5k_preserve(aconnector->dc_link) &&
+			    dc_link_has_tiled_root_panel_patch(aconnector->dc_link)) {
+				edid = (const struct edid *)apple5k_ae1f_edid;
+				edid_len = sizeof(apple5k_ae1f_edid);
+				drm_info(dev,
+					 "APPLE5K: root EDID overridden with macOS AE1F unified 5120x2880 (single display)\n");
+			}
+#endif
+
+			aconnector->drm_edid = drm_edid_alloc(edid, edid_len);
 			drm_edid_connector_update(connector, aconnector->drm_edid);
 
 			hdmi_cec_set_edid(aconnector);
@@ -6533,6 +6659,26 @@ static void update_stream_scaling_settings(struct drm_device *dev,
 	stream->src = src;
 	stream->dst = dst;
 
+#if APPLE5K_SINGLE_DISPLAY_5K
+	/*
+	 * Tiled 5K single-display: each stream presents one 2560-wide tile of the
+	 * 5120 crtc mode 1:1 -- the plane crops the correct half of the shared
+	 * framebuffer via its src_rect. Do NOT scale the full 5120 mode into the
+	 * 2560 OTG (the default above yields src=5120/dst=2560x1440), which makes
+	 * a 5120-wide source that fails dce112_validate_bandwidth -> no TG -> no
+	 * vblank -> flip_done timeouts. Force a 1:1 2560x2880 stream viewport.
+	 * This runs at every scaling update (modeset and the non-modeset paths),
+	 * so it cannot be reset back to the 5120 scaling on a later commit.
+	 */
+	if (stream->link && dc_link_apple5k_preserve(stream->link) &&
+	    dc_link_has_tiled_root_panel_patch(stream->link)) {
+		stream->src.x = 0; stream->src.y = 0;
+		stream->src.width = 2560; stream->src.height = 2880;
+		stream->dst.x = 0; stream->dst.y = 0;
+		stream->dst.width = 2560; stream->dst.height = 2880;
+	}
+#endif
+
 	drm_dbg_kms(dev, "Destination Rectangle x:%d  y:%d  width:%d  height:%d\n",
 		    dst.x, dst.y, dst.width, dst.height);
 
@@ -7439,6 +7585,22 @@ create_stream_for_sink(struct drm_connector *connector,
 #endif
 
 	update_stream_scaling_settings(dev, &mode, dm_state, stream);
+
+#if APPLE5K_SINGLE_DISPLAY_5K
+	/*
+	 * The tiled root advertises one 5120x2880 mode to userspace, but each DP
+	 * link carries only a 2560x2880 tile. Force the root stream to the fixed
+	 * tile timing here (before it is added to the DC context, so pipe/clock
+	 * resources are allocated for 2560). The peer stream clones this timing.
+	 */
+	if (dc_link_apple5k_preserve(stream->link) &&
+	    dc_link_has_tiled_root_panel_patch(stream->link)) {
+		apple5k_force_tile_timing(stream);
+		drm_info(dev,
+			 "APPLE5K: forced root stream to 2560x2880 tile timing (crtc mode is 5120x2880; src/dst=%dx%d)\n",
+			 stream->src.width, stream->src.height);
+	}
+#endif
 
 	fill_audio_info(
 		&stream->audio_info,
@@ -8681,6 +8843,23 @@ amdgpu_dm_reprobe_tiled_root_after_slave(struct amdgpu_device *adev)
 		return;
 	}
 
+#if APPLE5K_SINGLE_DISPLAY_5K
+	/*
+	 * Single-display 5K: the root connector EDID was already overridden to
+	 * the macOS AE1F unified 5120x2880 identity in
+	 * amdgpu_dm_update_connector_after_detect(). The legacy root re-read
+	 * below re-reads the real panel EDID (AE1E) from the wire and clobbers
+	 * that override, reverting the connector to a 2560 tiled view -- after
+	 * which the 5K plane split runs against a 2560 framebuffer and reads out
+	 * of bounds (GPU wedge). Skip the re-read so the AE1F override sticks.
+	 */
+	if (primary->dc_link && dc_link_apple5k_preserve(primary->dc_link)) {
+		drm_info(dev,
+			 "APPLE5K: skip legacy root EDID re-read (single-display keeps AE1F 5120x2880)\n");
+		return;
+	}
+#endif
+
 	/* Re-read only after the slave exposes tile metadata. */
 	if (!amdgpu_dm_connector_is_tiled_slave_tile(secondary)) {
 		drm_info(dev,
@@ -9670,6 +9849,26 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
 	amdgpu_dm_log_apple5k_connector_tile(amdgpu_dm_connector,
 					      "get-modes");
 
+#if APPLE5K_SINGLE_DISPLAY
+	/*
+	 * apple5k single-display: hide the slave (right) tile's connector from
+	 * userspace as a non-desktop output so compositors never assign it its
+	 * own crtc -- the root connector presents the whole 5120x2880 panel and
+	 * the kernel drives this tile as the root crtc's peer stream. Re-applied
+	 * on every probe so an EDID re-read can't clear it. The dc_link/sink and
+	 * tile metadata stay intact for the peer stream and the boot re-probe.
+	 */
+	if (amdgpu_dm_connector_has_tiled_slave_patch(amdgpu_dm_connector) &&
+	    dc_link_apple5k_preserve(dc_link)) {
+		connector->display_info.non_desktop = true;
+		drm_object_property_set_value(&connector->base,
+			connector->dev->mode_config.non_desktop_property, 1);
+		drm_info(connector->dev,
+			 "APPLE5K: slave tile connector %s marked non-desktop (single-display); root presents the panel\n",
+			 connector->name);
+	}
+#endif
+
 	amdgpu_dm_fbc_init(connector);
 
 	return amdgpu_dm_connector->num_modes;
@@ -10534,6 +10733,43 @@ static inline uint32_t get_mem_type(struct drm_framebuffer *fb)
 	return abo->tbo.resource ? abo->tbo.resource->mem_type : 0;
 }
 
+/*
+ * apple5k single-display: mirror the hardware cursor onto the peer (right-tile)
+ * stream, shifted left by 2560 so it appears on the right half of the 5120
+ * logical display. The root OTG clips the cursor at its own right edge; the
+ * peer shows the portion that lands in the right tile (x_hotspot clips the
+ * seam). No-op when @peer is NULL (every non-tiled crtc), so callers can pass
+ * dm_crtc_state->stream_peer unconditionally.
+ */
+void amdgpu_dm_apple5k_program_peer_cursor(struct dc_stream_state *peer,
+		struct dc_cursor_attributes *attrs,
+		const struct dc_cursor_position *root_pos)
+{
+	struct dc_cursor_position pos = *root_pos;
+	int x;
+
+	if (!peer)
+		return;
+
+	if (attrs)
+		dc_stream_program_cursor_attributes(peer, attrs);
+
+	x = (int)root_pos->x - 2560;
+	if (!root_pos->enable || x <= -256) {
+		/* cursor entirely in the left tile -> nothing on the peer */
+		pos.enable = false;
+		pos.x = 0;
+	} else if (x < 0) {
+		/* straddling the tile seam: clip the left part via the hotspot */
+		pos.x = 0;
+		pos.x_hotspot = root_pos->x_hotspot + (uint32_t)(-x);
+	} else {
+		pos.x = (uint32_t)x;
+	}
+
+	dc_stream_program_cursor_position(peer, &pos);
+}
+
 static void amdgpu_dm_update_cursor(struct drm_plane *plane,
 				    struct drm_plane_state *old_plane_state,
 				    struct dc_stream_update *update)
@@ -10565,6 +10801,8 @@ static void amdgpu_dm_update_cursor(struct drm_plane *plane,
 			dc_stream_set_cursor_position(crtc_state->stream,
 						      &position);
 			update->cursor_position = &crtc_state->stream->cursor_position;
+			amdgpu_dm_apple5k_program_peer_cursor(crtc_state->stream_peer,
+							      NULL, &position);
 		}
 		return;
 	}
@@ -10603,6 +10841,10 @@ static void amdgpu_dm_update_cursor(struct drm_plane *plane,
 			drm_err(adev_to_drm(adev), "DC failed to set cursor position\n");
 
 		update->cursor_position = &crtc_state->stream->cursor_position;
+
+		/* apple5k: also light the cursor on the right-tile peer stream. */
+		amdgpu_dm_apple5k_program_peer_cursor(crtc_state->stream_peer,
+						      &attributes, &position);
 	}
 }
 
@@ -10715,11 +10957,29 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 
 		bundle->stream_update.cursor_position =
 				&acrtc_state->stream->cursor_position;
+
+		/* apple5k: disable the native peer cursor too on this transition. */
+		amdgpu_dm_apple5k_program_peer_cursor(acrtc_state->stream_peer,
+						      NULL, &cursor_position);
 	}
 
 	if (acrtc_state->active_planes == 0 &&
 	    dm_old_crtc_state->cursor_mode == DM_CURSOR_NATIVE_MODE)
 		amdgpu_dm_commit_cursors(state);
+
+#if APPLE5K_SINGLE_DISPLAY_5K
+	/*
+	 * apple5k single-display 5K: the peer (right-tile) plane is flipped to
+	 * the same BO as the root plane but with a right-half viewport, and
+	 * submitted to the peer stream after the root submit (same dc_lock,
+	 * same frame). Captured during the plane loop for the primary plane.
+	 */
+	struct dc_plane_state *apple5k_peer_plane = NULL;
+	struct dc_scaling_info apple5k_peer_scaling = {0};
+	struct dc_surface_update apple5k_peer_su = {0};
+	struct dc_stream_update apple5k_peer_stream_update = {0};
+	int apple5k_peer_idx = 0;
+#endif
 
 	/* update planes when needed */
 	for_each_oldnew_plane_in_state(state, plane, old_plane_state, new_plane_state, i) {
@@ -10772,6 +11032,26 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 		bundle->surface_updates[planes_count].scaling_info =
 			&bundle->scaling_infos[planes_count];
 
+#if APPLE5K_SINGLE_DISPLAY_5K
+		/*
+		 * apple5k single-display 5K: fill_dc_scaling_info() above derived a
+		 * full 5120-wide viewport from the drm plane. Split it: the root
+		 * plane shows the LEFT half, and the peer plane (captured here) the
+		 * RIGHT half of the same BO. Done every flip because the scaling is
+		 * recomputed every flip.
+		 */
+		if (acrtc_state->stream_peer && dm_new_plane_state->dc_state_peer &&
+		    plane == pcrtc->primary &&
+		    new_plane_state->fb && new_plane_state->fb->width >= 5120 &&
+		    dc_link_apple5k_preserve(acrtc_state->stream->link)) {
+			/* Copy first (keeps scaling_quality etc.), then reconcile
+			 * all rects (incl. clip) to 2560 stream space. */
+			apple5k_peer_scaling = bundle->scaling_infos[planes_count];
+			apple5k_set_tile_scaling(&apple5k_peer_scaling, 2560);
+			apple5k_set_tile_scaling(&bundle->scaling_infos[planes_count], 0);
+		}
+#endif
+
 		plane_needs_flip = old_plane_state->fb && new_plane_state->fb;
 
 		pflip_present = pflip_present || plane_needs_flip;
@@ -10794,6 +11074,18 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 
 		bundle->surface_updates[planes_count].plane_info =
 			&bundle->plane_infos[planes_count];
+
+#if APPLE5K_SINGLE_DISPLAY_5K
+		/* Capture the peer plane only on an actual flip, so its reuse of
+		 * this index's flip_addr/plane_info (just filled) is valid. */
+		if (acrtc_state->stream_peer && dm_new_plane_state->dc_state_peer &&
+		    plane == pcrtc->primary &&
+		    new_plane_state->fb && new_plane_state->fb->width >= 5120 &&
+		    dc_link_apple5k_preserve(acrtc_state->stream->link)) {
+			apple5k_peer_plane = dm_new_plane_state->dc_state_peer;
+			apple5k_peer_idx = planes_count;
+		}
+#endif
 
 		if (acrtc_state->stream->link->psr_settings.psr_feature_enabled ||
 		    acrtc_state->stream->link->replay_settings.replay_feature_enabled) {
@@ -11013,6 +11305,35 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 					 acrtc_state->stream,
 					 &bundle->stream_update,
 					 bundle->surface_updates);
+
+#if APPLE5K_SINGLE_DISPLAY_5K
+		/*
+		 * apple5k single-display 5K: flip the peer (right-tile) plane to the
+		 * same BO/frame on the peer stream, under the same dc_lock. Reuses
+		 * the root plane's flip_addr (same surface) and plane_info, with the
+		 * right-half viewport captured above.
+		 */
+		if (apple5k_peer_plane && acrtc_state->stream_peer) {
+			/*
+			 * dc_update_planes_and_stream() dereferences stream_update->stream
+			 * unconditionally (NULL deref / Oops if unset). Point it at the
+			 * peer stream; all other stream_update fields stay zero, so no
+			 * stream-level change is applied -- only the surface flips.
+			 */
+			apple5k_peer_stream_update.stream = acrtc_state->stream_peer;
+			apple5k_peer_su.surface = apple5k_peer_plane;
+			apple5k_peer_su.scaling_info = &apple5k_peer_scaling;
+			apple5k_peer_su.flip_addr = &bundle->flip_addrs[apple5k_peer_idx];
+			apple5k_peer_su.plane_info = &bundle->plane_infos[apple5k_peer_idx];
+
+			update_planes_and_stream_adapter(dm->dc,
+						 acrtc_state->update_type,
+						 1,
+						 acrtc_state->stream_peer,
+						 &apple5k_peer_stream_update,
+						 &apple5k_peer_su);
+		}
+#endif
 		updated_planes_and_streams = true;
 
 		/**
@@ -11242,6 +11563,8 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 			mutex_lock(&dm->dc_lock);
 			dc_exit_ips_for_hw_access(dm->dc);
 			dc_stream_program_cursor_position(dm_old_crtc_state->stream, &position);
+			amdgpu_dm_apple5k_program_peer_cursor(dm_old_crtc_state->stream_peer,
+							      NULL, &position);
 			mutex_unlock(&dm->dc_lock);
 		}
 
@@ -12255,6 +12578,62 @@ static void set_freesync_fixed_config(struct dm_crtc_state *dm_new_crtc_state)
 	dm_new_crtc_state->freesync_config.fixed_refresh_in_uhz = res;
 }
 
+/*
+ * Build the slave-tile (right, 2560x2880) peer stream for the apple5k single
+ * display. Both tiles share identical timing (confirmed at modeset), so we
+ * clone the already-validated root stream's timing/geometry onto the slave
+ * link's sink. The peer carries no drm connector (dm_stream_context = NULL);
+ * it rides the root crtc's vblank/flip. Returns a stream with one reference
+ * (the create ref), or NULL.
+ */
+static struct dc_stream_state *
+create_apple5k_peer_stream(struct dc *dc, struct dc_state *context,
+			   struct dc_stream_state *root_stream)
+{
+	struct dc_link *peer_link;
+	struct dc_sink *sink;
+	struct dc_stream_state *peer;
+	int i;
+
+	if (!root_stream || !root_stream->link)
+		return NULL;
+
+	peer_link = root_stream->link->tiled_peer;
+	if (!peer_link || !peer_link->local_sink)
+		return NULL;
+
+	/*
+	 * Defensive: never create a second stream on the slave link. If one is
+	 * already present in this context (e.g. a transient boot/seamless slave
+	 * stream not yet torn down), skip -- a double stream on one link would
+	 * fail validation. The disable pass removes the slave crtc's stream
+	 * before this enable pass runs, so normally the link is free here.
+	 */
+	for (i = 0; context && i < context->stream_count; i++) {
+		if (context->streams[i] &&
+		    context->streams[i]->link == peer_link)
+			return NULL;
+	}
+
+	sink = peer_link->local_sink;
+	dc_sink_retain(sink);
+	peer = dc_create_stream_for_sink(sink);
+	dc_sink_release(sink);
+	if (!peer)
+		return NULL;
+
+	/* No drm connector backs the peer; it is internal to the root crtc. */
+	peer->dm_stream_context = NULL;
+
+	/* Both tiles are timing-identical; mirror the validated root stream. */
+	peer->timing = root_stream->timing;
+	peer->src = root_stream->src;
+	peer->dst = root_stream->dst;
+	peer->output_color_space = root_stream->output_color_space;
+
+	return peer;
+}
+
 static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
 			 struct drm_atomic_state *state,
 			 struct drm_crtc *crtc,
@@ -12398,7 +12777,19 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
 		 */
 		if (!new_crtc_state->active &&
 		    dm_old_crtc_state->stream &&
-		    dc_link_apple5k_preserve(dm_old_crtc_state->stream->link)) {
+		    dc_link_apple5k_preserve(dm_old_crtc_state->stream->link) &&
+		    (!APPLE5K_SINGLE_DISPLAY ||
+		     dc_link_has_tiled_root_panel_patch(dm_old_crtc_state->stream->link))) {
+			/*
+			 * Keep the ROOT tile's stream across CRTC-off so the LCD
+			 * stays native. In single-display mode the SLAVE tile has
+			 * no crtc of its own -- it is driven as the root crtc's
+			 * peer stream -- so a slave crtc being disabled (e.g. the
+			 * transient boot slave crtc that KWin tears down once the
+			 * slave connector is non-desktop) must NOT be kept here,
+			 * or it would collide with the peer stream on the same
+			 * link. Hence the root-only restriction.
+			 */
 			DRM_INFO("APPLE5K: keep tiled eDP stream in context across CRTC-off (enable=%d active=%d) -- LCD stays native\n",
 				 new_crtc_state->enable, new_crtc_state->active);
 			goto skip_modeset;
@@ -12453,6 +12844,23 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
 		dc_stream_release(dm_old_crtc_state->stream);
 		dm_new_crtc_state->stream = NULL;
 
+		/*
+		 * apple5k single-display: tear down the slave-tile peer stream
+		 * alongside the root (mirrors the root remove above). The
+		 * keep-stream gate ahead of this branch skips the whole removal
+		 * for a tiled CRTC-off, so the peer is only removed on a genuine
+		 * modeset/disable.
+		 */
+		if (dm_old_crtc_state->stream_peer) {
+			if (dc_state_remove_stream(dm->dc, dm_state->context,
+					dm_old_crtc_state->stream_peer) != DC_OK) {
+				ret = -EINVAL;
+				goto fail;
+			}
+			dc_stream_release(dm_old_crtc_state->stream_peer);
+			dm_new_crtc_state->stream_peer = NULL;
+		}
+
 		reset_freesync_config_for_crtc(dm_new_crtc_state);
 
 		*lock_and_validation_needed = true;
@@ -12484,6 +12892,83 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
 
 			drm_dbg_atomic(adev_to_drm(adev), "Enabling DRM crtc: %d\n",
 					 crtc->base.id);
+
+			/*
+			 * apple5k Stage 0 instrumentation: for the tiled root,
+			 * dump the root stream timing and the slave peer link /
+			 * sink so we can confirm the per-tile (2560x2880) timing
+			 * to clone for the peer stream, and how many streams are
+			 * already in the DC context. Read-only; tiled root only.
+			 */
+			if (dc_link_apple5k_preserve(new_stream->link)) {
+				struct dc_link *peer = new_stream->link->tiled_peer;
+				struct dc_crtc_timing *t = &new_stream->timing;
+
+				drm_info(adev_to_drm(adev),
+					 "APPLE5K: stage0 crtc=%d root link[%u] stream timing %ux%u total %ux%u pixclk_100hz=%u front_porch h=%u v=%u sync h=%u v=%u; ctx stream_count=%u\n",
+					 crtc->base.id, new_stream->link->link_index,
+					 t->h_addressable, t->v_addressable,
+					 t->h_total, t->v_total, t->pix_clk_100hz,
+					 t->h_front_porch, t->v_front_porch,
+					 t->h_sync_width, t->v_sync_width,
+					 dm_state->context->stream_count);
+				if (peer)
+					drm_info(adev_to_drm(adev),
+						 "APPLE5K: stage0 peer link[%u] signal=%d has_sink=%d preserve=%d\n",
+						 peer->link_index, peer->connector_signal,
+						 !!peer->local_sink,
+						 dc_link_apple5k_preserve(peer));
+				else
+					drm_info(adev_to_drm(adev),
+						 "APPLE5K: stage0 no tiled_peer on root link[%u]\n",
+						 new_stream->link->link_index);
+			}
+
+			/*
+			 * apple5k single-display: drive the slave (right) tile
+			 * from this SAME root crtc as a peer stream, so one
+			 * connector presents the whole 5120x2880 panel and both
+			 * tiles commit together in one dc_commit_streams() (the
+			 * panel TCON latches native only when both come up at
+			 * once). The peer is added to the same DC context, so
+			 * dc_commit_streams() brings up its pipe automatically.
+			 * Refcounting mirrors the root stream above exactly.
+			 */
+			if (APPLE5K_SINGLE_DISPLAY &&
+			    dc_link_has_tiled_root_panel_patch(new_stream->link) &&
+			    dc_link_apple5k_preserve(new_stream->link) &&
+			    !dm_new_crtc_state->stream_peer) {
+				struct dc_stream_state *peer =
+					create_apple5k_peer_stream(dm->dc,
+						dm_state->context, new_stream);
+
+				if (peer) {
+					dm_new_crtc_state->stream_peer = peer;
+					dc_stream_retain(peer);
+
+					if (dc_state_add_stream(dm->dc,
+							dm_state->context, peer) != DC_OK) {
+						dm_new_crtc_state->stream_peer = NULL;
+						dc_stream_release(peer); /* crtc_state ref */
+						dc_stream_release(peer); /* create ref */
+						ret = -EINVAL;
+						goto fail;
+					}
+
+					/* Drop the local create ref; crtc_state + context hold one each. */
+					dc_stream_release(peer);
+
+					drm_info(adev_to_drm(adev),
+						 "APPLE5K: added peer slave-tile stream link[%u] %ux%u (one crtc drives both tiles); ctx stream_count=%u\n",
+						 peer->link ? peer->link->link_index : 0xffu,
+						 peer->timing.h_addressable,
+						 peer->timing.v_addressable,
+						 dm_state->context->stream_count);
+				} else {
+					drm_warn(adev_to_drm(adev),
+						 "APPLE5K: peer slave-tile stream NOT created (no peer sink?) -- right tile will be dark\n");
+				}
+			}
 
 			if (dc_state_add_stream(
 					dm->dc,
@@ -12924,6 +13409,19 @@ static int dm_update_plane_state(struct dc *dc,
 
 		dm_new_plane_state->dc_state = NULL;
 
+#if APPLE5K_SINGLE_DISPLAY_5K
+		/* apple5k single-display 5K: tear down the peer (right-tile) plane. */
+		if (dm_old_plane_state->dc_state_peer) {
+			if (dm_old_crtc_state->stream_peer &&
+			    !dc_state_remove_plane(dc, dm_old_crtc_state->stream_peer,
+						   dm_old_plane_state->dc_state_peer,
+						   dm_state->context))
+				return -EINVAL;
+			dc_plane_state_release(dm_old_plane_state->dc_state_peer);
+			dm_new_plane_state->dc_state_peer = NULL;
+		}
+#endif
+
 		*lock_and_validation_needed = true;
 
 	} else { /* Add new planes */
@@ -13010,6 +13508,61 @@ static int dm_update_plane_state(struct dc *dc,
 		 * is a plane change. Inefficient, but works for now.
 		 */
 		dm_new_plane_state->dc_state->update_flags.bits.full_update = 1;
+
+#if APPLE5K_SINGLE_DISPLAY_5K
+		/*
+		 * apple5k single-display 5K: the framebuffer is the full 5120x2880
+		 * surface but each tile stream is 2560x2880. Constrain this (root)
+		 * plane to the LEFT viewport and create a peer plane for the RIGHT
+		 * viewport on the crtc's peer stream, both into the same GEM BO.
+		 * (The flip path re-applies these viewports on every page-flip.)
+		 * Lifecycle mirrors dc_state exactly (dup retains, destroy releases).
+		 */
+		if (dm_new_crtc_state->stream_peer &&
+		    dm_new_crtc_state->stream &&
+		    dc_link_apple5k_preserve(dm_new_crtc_state->stream->link) &&
+		    new_plane_state->fb && new_plane_state->fb->width >= 5120) {
+			struct dc_plane_state *peer_plane = dc_create_plane_state(dc);
+
+			if (!peer_plane) {
+				ret = -ENOMEM;
+				goto out;
+			}
+
+			ret = fill_dc_plane_attributes(
+				drm_to_adev(new_plane_crtc->dev),
+				peer_plane, new_plane_state, new_crtc_state);
+			if (ret) {
+				dc_plane_state_release(peer_plane);
+				goto out;
+			}
+
+			/* Root plane -> left half; peer plane -> right half. All
+			 * rects (incl. clip) reconciled to 2560 stream space. */
+			apple5k_set_tile_plane_rects(dc_new_plane_state, 0);
+			apple5k_set_tile_plane_rects(peer_plane, 2560);
+			peer_plane->update_flags.bits.full_update = 1;
+
+			if (!dc_state_add_plane(dc, dm_new_crtc_state->stream_peer,
+						peer_plane, dm_state->context)) {
+				dc_plane_state_release(peer_plane);
+				ret = -EINVAL;
+				goto out;
+			}
+
+			dm_new_plane_state->dc_state_peer = peer_plane;
+
+			drm_info(new_plane_crtc->dev,
+				 "APPLE5K: 5K plane split (modeset) root src(%d,%d %dx%d) dst(%d,%d %dx%d) clip(%dx%d); peer src.x=%d; root_stream=%p peer_stream=%p\n",
+				 dc_new_plane_state->src_rect.x, dc_new_plane_state->src_rect.y,
+				 dc_new_plane_state->src_rect.width, dc_new_plane_state->src_rect.height,
+				 dc_new_plane_state->dst_rect.x, dc_new_plane_state->dst_rect.y,
+				 dc_new_plane_state->dst_rect.width, dc_new_plane_state->dst_rect.height,
+				 dc_new_plane_state->clip_rect.width, dc_new_plane_state->clip_rect.height,
+				 peer_plane->src_rect.x,
+				 dm_new_crtc_state->stream, dm_new_crtc_state->stream_peer);
+		}
+#endif
 
 		*lock_and_validation_needed = true;
 	}

@@ -899,6 +899,13 @@ struct dm_plane_state {
 	struct drm_plane_state base;
 	struct dc_plane_state *dc_state;
 
+	/*
+	 * apple5k single-display 5K: the peer (right-tile) plane. Same GEM BO as
+	 * @dc_state but a right-half viewport (src_x=2560), attached to the
+	 * crtc's peer stream. NULL on every non-tiled plane.
+	 */
+	struct dc_plane_state *dc_state_peer;
+
 	/* Plane color mgmt */
 	/**
 	 * @degamma_lut:
@@ -974,6 +981,16 @@ enum amdgpu_dm_cursor_mode {
 struct dm_crtc_state {
 	struct drm_crtc_state base;
 	struct dc_stream_state *stream;
+
+	/*
+	 * apple5k single-display: the iMac Pro 5K panel is two DP tiles. The
+	 * root (left, 2560x2880) tile is driven by @stream; the slave (right)
+	 * tile is driven by this peer stream, so one drm_crtc presents the whole
+	 * 5120x2880 panel to userspace (matching the macOS/EFI single display).
+	 * NULL on every non-tiled crtc. Both streams are committed together in
+	 * one dc_commit_streams() so the panel TCON latches native dual-tile.
+	 */
+	struct dc_stream_state *stream_peer;
 
 	bool cm_has_degamma;
 	bool cm_is_degamma_srgb;
