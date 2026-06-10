@@ -157,6 +157,208 @@ MODULE_FIRMWARE(FIRMWARE_DCN_401_DMUB);
 
 #define APPLE5K_PRESERVE_MIN_BPC 10
 
+/*
+ * Dual-tile single-display stitching ("tiled stitch"). When enabled for a
+ * supported Apple iMac 5K internal dual-tile panel, the panel is presented to
+ * userspace as ONE full-width display: the root (left) tile's connector
+ * carries a synthesized stitched mode, the slave (right) tile's connector is
+ * hidden (non_desktop) so it never claims a second crtc, and one drm_crtc
+ * drives the root tile via dm_crtc_state->stream and the slave tile via
+ * dm_crtc_state->stream_peer, both committed together in one
+ * dc_commit_streams() (the Apple TCON latches native dual-tile mode only when
+ * both tiles come up together). The single full-width framebuffer is split
+ * into per-tile viewports via per-stream plane src_rect, and the hardware
+ * cursor is mirrored onto the peer stream across the tile seam.
+ *
+ * Controlled by the amdgpu.tiled_stitch module parameter: -1 (default) and 1
+ * enable stitching only for supported Apple iMac 5K panels whose peer link was
+ * wired by the Apple panel quirk path (tiled_pair_apple), while 0 disables
+ * stitching and leaves the existing two-connector tile-group behaviour.
+ */
+static bool amdgpu_dm_link_tiled_stitch_enabled(const struct dc_link *link)
+{
+	const struct dc_link *root;
+
+	if (amdgpu_tiled_stitch == 0 || !link)
+		return false;
+
+	if (link->tiled_role == DC_TILED_ROLE_ROOT)
+		root = link;
+	else if (link->tiled_role == DC_TILED_ROLE_SLAVE)
+		root = link->tiled_peer;
+	else
+		return false;
+
+	if (!root || root->tiled_role != DC_TILED_ROLE_ROOT || !root->tiled_peer)
+		return false;
+
+	return root->tiled_pair_apple;
+}
+
+static bool amdgpu_dm_link_is_tiled_stitch_root(const struct dc_link *link)
+{
+	return link && link->tiled_role == DC_TILED_ROLE_ROOT &&
+	       amdgpu_dm_link_tiled_stitch_enabled(link);
+}
+
+static bool amdgpu_dm_link_is_tiled_stitch_slave(const struct dc_link *link)
+{
+	return link && link->tiled_role == DC_TILED_ROLE_SLAVE &&
+	       amdgpu_dm_link_tiled_stitch_enabled(link);
+}
+
+/*
+ * Tile geometry of a stitchable connector: exactly two side-by-side tiles
+ * of one monitor. Fills the per-tile size from the DisplayID tile block.
+ */
+static bool amdgpu_dm_connector_tiled_stitch_geometry(const struct drm_connector *connector,
+						      int *tile_w, int *tile_h)
+{
+	if (!connector->has_tile || connector->num_h_tile != 2 ||
+	    connector->num_v_tile != 1 || !connector->tile_h_size ||
+	    !connector->tile_v_size)
+		return false;
+
+	*tile_w = connector->tile_h_size;
+	*tile_h = connector->tile_v_size;
+	return true;
+}
+
+static bool amdgpu_dm_tiled_stitch_mode_is_stitched(
+		const struct drm_connector *connector,
+		const struct drm_display_mode *mode)
+{
+	struct drm_display_mode *listed;
+	int tile_w, tile_h;
+
+	if (!amdgpu_dm_connector_tiled_stitch_geometry(connector, &tile_w, &tile_h))
+		return false;
+
+	if (mode->hdisplay != 2 * tile_w || mode->vdisplay != tile_h)
+		return false;
+
+	list_for_each_entry(listed, &connector->probed_modes, head) {
+		if (drm_mode_equal(mode, listed))
+			return true;
+	}
+
+	list_for_each_entry(listed, &connector->modes, head) {
+		if (drm_mode_equal(mode, listed))
+			return true;
+	}
+
+	return false;
+}
+
+static bool amdgpu_dm_tiled_stitch_has_live_root_stream(
+		const struct amdgpu_dm_connector *aconnector,
+		const struct dm_crtc_state *dm_old_crtc_state,
+		const struct drm_crtc_state *new_crtc_state)
+{
+	if (!aconnector || !dm_old_crtc_state || !dm_old_crtc_state->stream ||
+	    !new_crtc_state->active || !new_crtc_state->mode_changed)
+		return false;
+
+	return amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link) &&
+	       amdgpu_dm_link_is_tiled_stitch_root(dm_old_crtc_state->stream->link);
+}
+
+/*
+ * Force a stitched root stream from the full-width CRTC mode down to the
+ * per-tile timing each DP link actually carries. The synthesized stitched
+ * mode is the per-tile native mode doubled horizontally (see
+ * amdgpu_dm_replace_tiled_stitch_modes()), so exact halving recovers the
+ * panel's real tile timing -- no captured constants. Only applies when the
+ * stream carries the stitched mode exposed by the root connector. The stream
+ * is left with a 1:1 tile-sized viewport (no stream scaling -- scaling the
+ * full-width mode into a tile-wide OTG fails DCE12 bandwidth validation); the
+ * left/right half of the framebuffer is selected by the per-stream plane
+ * src_rect in the plane and flip paths.
+ */
+static bool amdgpu_dm_tiled_stitch_apply_tile_timing(struct dc_stream_state *stream,
+						     struct drm_connector *connector)
+{
+	struct dc_crtc_timing *t = &stream->timing;
+	int tile_w, tile_h;
+
+	if (!stream->link || !amdgpu_dm_link_is_tiled_stitch_root(stream->link))
+		return false;
+	if (!amdgpu_dm_connector_tiled_stitch_geometry(connector, &tile_w, &tile_h))
+		return false;
+	if (t->h_addressable != 2 * (uint32_t)tile_w ||
+	    t->v_addressable != (uint32_t)tile_h)
+		return false;
+
+	/* All even by construction (the stitched mode is a doubled tile mode). */
+	WARN_ON_ONCE((t->h_total | t->h_front_porch | t->h_sync_width |
+		      t->pix_clk_100hz) & 1);
+
+	t->h_addressable /= 2;
+	t->h_front_porch /= 2;
+	t->h_sync_width  /= 2;
+	t->h_total       /= 2;
+	t->h_border_left  = 0;
+	t->h_border_right = 0;
+	t->pix_clk_100hz /= 2;
+
+	stream->src.x = 0; stream->src.y = 0;
+	stream->src.width = tile_w; stream->src.height = tile_h;
+	stream->dst = stream->src;
+
+	return true;
+}
+
+/*
+ * Point a tile plane at one half of the full-width framebuffer: @src_x
+ * selects the left (0) or right (tile_w) viewport, and dst/clip are the full
+ * tile (stream space). All three rects MUST be in tile stream space --
+ * leaving clip_rect at the stitched crtc size produces an invalid pipe
+ * (grey/wedge).
+ */
+static void tiled_stitch_set_plane_rects(struct dc_plane_state *p, int src_x,
+					 int tile_w, int tile_h)
+{
+	p->src_rect.x = src_x; p->src_rect.y = 0;
+	p->src_rect.width = tile_w; p->src_rect.height = tile_h;
+	p->dst_rect.x = 0; p->dst_rect.y = 0;
+	p->dst_rect.width = tile_w; p->dst_rect.height = tile_h;
+	p->clip_rect.x = 0; p->clip_rect.y = 0;
+	p->clip_rect.width = tile_w; p->clip_rect.height = tile_h;
+}
+
+/* Same, for a dc_scaling_info used on the flip path. */
+static void tiled_stitch_set_scaling(struct dc_scaling_info *s, int src_x,
+				     int tile_w, int tile_h)
+{
+	s->src_rect.x = src_x; s->src_rect.y = 0;
+	s->src_rect.width = tile_w; s->src_rect.height = tile_h;
+	s->dst_rect.x = 0; s->dst_rect.y = 0;
+	s->dst_rect.width = tile_w; s->dst_rect.height = tile_h;
+	s->clip_rect.x = 0; s->clip_rect.y = 0;
+	s->clip_rect.width = tile_w; s->clip_rect.height = tile_h;
+}
+
+/*
+ * A stitched root presents the whole panel as one ordinary display, so hide
+ * the userspace-visible TILE blob (otherwise tile-aware compositors would
+ * try to stitch with a hidden slave). The kernel-side tile fields are kept:
+ * the stitch geometry and the tiled reprobe logic still need them. Must run
+ * after every drm_edid_connector_update() of the root, which rebuilds the
+ * blob. The slave's blob is left alone; it is hidden via non_desktop.
+ */
+static void amdgpu_dm_tiled_stitch_hide_tile_property(struct amdgpu_dm_connector *aconnector)
+{
+	struct drm_connector *connector = &aconnector->base;
+	bool had_tile = connector->has_tile;
+
+	if (!had_tile || !amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link))
+		return;
+
+	connector->has_tile = false;
+	drm_connector_set_tile_property(connector);
+	connector->has_tile = had_tile;
+}
+
 /**
  * DOC: overview
  *
@@ -231,6 +433,7 @@ static int amdgpu_dm_encoder_init(struct drm_device *dev,
 				  uint32_t link_index);
 
 static int amdgpu_dm_connector_get_modes(struct drm_connector *connector);
+static void amdgpu_dm_get_native_mode(struct drm_connector *connector);
 static bool amdgpu_dm_mode_matches_tile_size(
 		const struct drm_connector *connector,
 		const struct drm_display_mode *mode);
@@ -3207,6 +3410,11 @@ static void dm_destroy_cached_state(struct amdgpu_device *adev)
 			dc_plane_state_release(dm_new_plane_state->dc_state);
 			dm_new_plane_state->dc_state = NULL;
 		}
+		/* tiled stitch: release the peer (right-tile) plane too. */
+		if (dm_new_plane_state->dc_state_peer) {
+			dc_plane_state_release(dm_new_plane_state->dc_state_peer);
+			dm_new_plane_state->dc_state_peer = NULL;
+		}
 	}
 
 	drm_atomic_helper_resume(ddev, dm->cached_state);
@@ -3943,6 +4151,15 @@ void amdgpu_dm_update_connector_after_detect(
 
 			aconnector->drm_edid = drm_edid_alloc(edid, sink->dc_edid.length);
 			drm_edid_connector_update(connector, aconnector->drm_edid);
+
+			/*
+			 * Tiled stitch: Apple iMac peer links are wired at
+			 * EDID-parse time by the panel quirk path. The tile
+			 * fields were just (re)populated from the EDID, so hide
+			 * the root's userspace TILE blob when that iMac stitch
+			 * path is active.
+			 */
+			amdgpu_dm_tiled_stitch_hide_tile_property(aconnector);
 
 			hdmi_cec_set_edid(aconnector);
 			if (aconnector->dc_link->aux_mode)
@@ -6535,6 +6752,29 @@ static void update_stream_scaling_settings(struct drm_device *dev,
 	stream->src = src;
 	stream->dst = dst;
 
+	/*
+	 * Tiled stitch: each stream presents one tile of the stitched crtc mode
+	 * 1:1 -- the plane crops the correct half of the shared framebuffer via
+	 * its src_rect. Do NOT scale the full-width mode into the tile-wide OTG
+	 * (the default above yields a full-width source that fails
+	 * dce112_validate_bandwidth -> no TG -> no vblank -> flip_done
+	 * timeouts). Force a 1:1 tile-sized stream viewport. This runs at every
+	 * scaling update (modeset and the non-modeset paths), so it cannot be
+	 * reset back to the stitched-width scaling on a later commit. Only
+	 * fires once the stream timing has been forced to the tile timing
+	 * (h_addressable == half the stitched mode); at the un-forced
+	 * create_stream_for_sink() call the timing still matches the mode and
+	 * amdgpu_dm_tiled_stitch_apply_tile_timing() sets src/dst itself.
+	 */
+	if (stream->link && amdgpu_dm_link_is_tiled_stitch_root(stream->link) &&
+	    mode->hdisplay == 2 * (int)stream->timing.h_addressable &&
+	    mode->vdisplay == (int)stream->timing.v_addressable) {
+		stream->src.x = 0; stream->src.y = 0;
+		stream->src.width = stream->timing.h_addressable;
+		stream->src.height = stream->timing.v_addressable;
+		stream->dst = stream->src;
+	}
+
 	drm_dbg_kms(dev, "Destination Rectangle x:%d  y:%d  width:%d  height:%d\n",
 		    dst.x, dst.y, dst.width, dst.height);
 
@@ -7441,6 +7681,20 @@ create_stream_for_sink(struct drm_connector *connector,
 #endif
 
 	update_stream_scaling_settings(dev, &mode, dm_state, stream);
+
+	/*
+	 * Tiled stitch: the root advertises one stitched full-width mode to
+	 * userspace, but each DP link carries only a tile. Force the root
+	 * stream down to the per-tile timing here (before it is added to the
+	 * DC context, so pipe/clock resources are allocated for the tile
+	 * width). The peer stream clones this timing.
+	 */
+	if (amdgpu_dm_tiled_stitch_apply_tile_timing(stream, connector))
+		drm_info(dev,
+			 "TILED_STITCH: forced root stream to %ux%u tile timing (crtc mode is %dx%d; src/dst=%dx%d)\n",
+			 stream->timing.h_addressable, stream->timing.v_addressable,
+			 mode.hdisplay, mode.vdisplay,
+			 stream->src.width, stream->src.height);
 
 	fill_audio_info(
 		&stream->audio_info,
@@ -8643,6 +8897,70 @@ amdgpu_dm_make_tile_mode_preferred(struct drm_connector *connector)
 	}
 }
 
+/*
+ * Tiled stitch: synthesize the stitched full-width mode on the root tile's
+ * connector by doubling the per-tile native mode horizontally (hdisplay,
+ * sync, total and pixel clock x2; vertical timing unchanged, so the refresh
+ * rate is preserved). The result is exactly halvable back to the panel's
+ * real tile timing by amdgpu_dm_tiled_stitch_apply_tile_timing(). The
+ * stitched mode becomes the only exposed mode; per-tile modes are removed
+ * because selecting one would bypass the peer stream and light only one tile.
+ * Returns the number of modes left in the probed list (0 or 1).
+ */
+static int amdgpu_dm_replace_tiled_stitch_modes(struct drm_connector *connector)
+{
+	struct amdgpu_dm_connector *aconnector =
+			to_amdgpu_dm_connector(connector);
+	struct drm_display_mode *mode, *tmp;
+	struct drm_display_mode *tile_mode = NULL;
+	struct drm_display_mode *stitched;
+	int tile_w, tile_h;
+
+	if (!amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link))
+		return 0;
+	if (!amdgpu_dm_connector_tiled_stitch_geometry(connector, &tile_w, &tile_h))
+		return 0;
+
+	/* The per-tile native mode: prefer the (just-promoted) preferred one. */
+	list_for_each_entry(mode, &connector->probed_modes, head) {
+		if (!amdgpu_dm_mode_matches_tile_size(connector, mode))
+			continue;
+		if (!tile_mode || (mode->type & DRM_MODE_TYPE_PREFERRED))
+			tile_mode = mode;
+		if (mode->type & DRM_MODE_TYPE_PREFERRED)
+			break;
+	}
+	if (!tile_mode)
+		return 0; /* root not re-probed yet; no tile mode to double */
+
+	stitched = drm_mode_duplicate(connector->dev, tile_mode);
+	if (!stitched)
+		return 0;
+
+	stitched->hdisplay    *= 2;
+	stitched->hsync_start *= 2;
+	stitched->hsync_end   *= 2;
+	stitched->htotal      *= 2;
+	stitched->hskew        = 0;
+	stitched->clock       *= 2;
+	stitched->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+	drm_mode_set_name(stitched);
+
+	list_for_each_entry_safe(mode, tmp, &connector->probed_modes, head) {
+		list_del(&mode->head);
+		drm_mode_destroy(connector->dev, mode);
+	}
+
+	drm_mode_probed_add(connector, stitched);
+	amdgpu_dm_get_native_mode(connector);
+
+	drm_info(connector->dev,
+		 "TILED_STITCH: exposed only stitched mode %s on %s (tile %dx%d)\n",
+		 stitched->name, connector->name, tile_w, tile_h);
+
+	return 1;
+}
+
 static void
 amdgpu_dm_reprobe_tiled_root_after_slave(struct amdgpu_device *adev)
 {
@@ -8766,6 +9084,8 @@ amdgpu_dm_reprobe_tiled_root_after_slave(struct amdgpu_device *adev)
 		primary->drm_edid = drm_edid_alloc(edid, sink->dc_edid.length);
 		mutex_lock(&dev->mode_config.mutex);
 		drm_edid_connector_update(&primary->base, primary->drm_edid);
+		/* The re-read root now carries the tile block; hide it again. */
+		amdgpu_dm_tiled_stitch_hide_tile_property(primary);
 		mutex_unlock(&dev->mode_config.mutex);
 	}
 
@@ -8908,6 +9228,7 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
 	 * here via the amdgpu_dm_connector_helper_funcs
 	 */
 	struct amdgpu_dm_connector *aconnector = to_amdgpu_dm_connector(connector);
+	int tile_w = 0, tile_h = 0;
 
 	if ((mode->flags & DRM_MODE_FLAG_INTERLACE) ||
 			(mode->flags & DRM_MODE_FLAG_DBLSCAN))
@@ -8922,6 +9243,19 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
 			 mode->name, mode->hdisplay, mode->vdisplay,
 			 mode->clock, connector->tile_h_size,
 			 connector->tile_v_size, MODE_PANEL);
+		return MODE_PANEL;
+	}
+
+	if (amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link) &&
+	    !amdgpu_dm_tiled_stitch_mode_is_stitched(connector, mode)) {
+		amdgpu_dm_connector_tiled_stitch_geometry(connector,
+							  &tile_w, &tile_h);
+		drm_info(connector->dev,
+			 "APPLE5K: mode_valid stitch root reject connector=%s link[%u] mode=\"%s\" %dx%d clock=%d stitch_size=%ux%u result=%d\n",
+			 connector->name,
+			 aconnector->dc_link ? aconnector->dc_link->link_index : 0xffffffff,
+			 mode->name, mode->hdisplay, mode->vdisplay,
+			 mode->clock, 2 * tile_w, tile_h, MODE_PANEL);
 		return MODE_PANEL;
 	}
 
@@ -9654,6 +9988,7 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
 	const struct drm_edid *drm_edid = amdgpu_dm_connector->drm_edid;
 	struct dc_link_settings *verified_link_cap = &dc_link->verified_link_cap;
 	const struct dc *dc = dc_link->dc;
+	int stitch_modes;
 
 	encoder = amdgpu_dm_connector_to_encoder(connector);
 
@@ -9682,9 +10017,30 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
 	}
 
 	amdgpu_dm_make_tile_mode_preferred(connector);
+	stitch_modes = amdgpu_dm_replace_tiled_stitch_modes(connector);
+	if (stitch_modes)
+		amdgpu_dm_connector->num_modes = stitch_modes;
 	amdgpu_dm_log_apple5k_modes(connector, "get-modes");
 	amdgpu_dm_log_apple5k_connector_tile(amdgpu_dm_connector,
 					      "get-modes");
+
+	/*
+	 * Tiled stitch: hide the slave (right) tile's connector from userspace
+	 * as a non-desktop output so compositors never assign it its own crtc
+	 * -- the root connector presents the whole stitched panel and the
+	 * kernel drives this tile as the root crtc's peer stream. Re-applied
+	 * on every probe so an EDID re-read can't clear it. The dc_link/sink
+	 * and tile metadata stay intact for the peer stream and the boot
+	 * re-probe.
+	 */
+	if (amdgpu_dm_link_is_tiled_stitch_slave(dc_link)) {
+		connector->display_info.non_desktop = true;
+		drm_object_property_set_value(&connector->base,
+			connector->dev->mode_config.non_desktop_property, 1);
+		drm_info(connector->dev,
+			 "TILED_STITCH: slave tile connector %s marked non-desktop; root presents the panel\n",
+			 connector->name);
+	}
 
 	amdgpu_dm_fbc_init(connector);
 
@@ -10550,6 +10906,49 @@ static inline uint32_t get_mem_type(struct drm_framebuffer *fb)
 	return abo->tbo.resource ? abo->tbo.resource->mem_type : 0;
 }
 
+/*
+ * Tiled stitch: mirror the hardware cursor onto the peer (right-tile) stream,
+ * shifted left by one tile width so it appears on the right half of the
+ * stitched logical display. The root OTG clips the cursor at its own right
+ * edge; the peer shows the portion that lands in the right tile (x_hotspot
+ * clips the seam). No-op when @peer is NULL (every non-stitched crtc), so
+ * callers can pass dm_crtc_state->stream_peer unconditionally.
+ */
+void amdgpu_dm_tiled_program_peer_cursor(struct dc_stream_state *peer,
+		struct dc_cursor_attributes *attrs,
+		const struct dc_cursor_position *root_pos)
+{
+	struct dc_cursor_position pos = *root_pos;
+	int tile_w;
+	int max_cursor;
+	int x;
+
+	if (!peer)
+		return;
+
+	if (attrs)
+		dc_stream_program_cursor_attributes(peer, attrs);
+
+	/* The peer stream carries the tile timing (cloned from the root). */
+	tile_w = peer->timing.h_addressable;
+	max_cursor = peer->ctx->dc->caps.max_cursor_size;
+
+	x = (int)root_pos->x - tile_w;
+	if (!root_pos->enable || x <= -max_cursor) {
+		/* cursor entirely in the left tile -> nothing on the peer */
+		pos.enable = false;
+		pos.x = 0;
+	} else if (x < 0) {
+		/* straddling the tile seam: clip the left part via the hotspot */
+		pos.x = 0;
+		pos.x_hotspot = root_pos->x_hotspot + (uint32_t)(-x);
+	} else {
+		pos.x = (uint32_t)x;
+	}
+
+	dc_stream_program_cursor_position(peer, &pos);
+}
+
 static void amdgpu_dm_update_cursor(struct drm_plane *plane,
 				    struct drm_plane_state *old_plane_state,
 				    struct dc_stream_update *update)
@@ -10581,6 +10980,8 @@ static void amdgpu_dm_update_cursor(struct drm_plane *plane,
 			dc_stream_set_cursor_position(crtc_state->stream,
 						      &position);
 			update->cursor_position = &crtc_state->stream->cursor_position;
+			amdgpu_dm_tiled_program_peer_cursor(crtc_state->stream_peer,
+							      NULL, &position);
 		}
 		return;
 	}
@@ -10619,6 +11020,10 @@ static void amdgpu_dm_update_cursor(struct drm_plane *plane,
 			drm_err(adev_to_drm(adev), "DC failed to set cursor position\n");
 
 		update->cursor_position = &crtc_state->stream->cursor_position;
+
+		/* apple5k: also light the cursor on the right-tile peer stream. */
+		amdgpu_dm_tiled_program_peer_cursor(crtc_state->stream_peer,
+						      &attributes, &position);
 	}
 }
 
@@ -10731,11 +11136,27 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 
 		bundle->stream_update.cursor_position =
 				&acrtc_state->stream->cursor_position;
+
+		/* apple5k: disable the native peer cursor too on this transition. */
+		amdgpu_dm_tiled_program_peer_cursor(acrtc_state->stream_peer,
+						      NULL, &cursor_position);
 	}
 
 	if (acrtc_state->active_planes == 0 &&
 	    dm_old_crtc_state->cursor_mode == DM_CURSOR_NATIVE_MODE)
 		amdgpu_dm_commit_cursors(state);
+
+	/*
+	 * Tiled stitch: the peer (right-tile) plane is flipped to the same BO
+	 * as the root plane but with a right-half viewport, and submitted to
+	 * the peer stream after the root submit (same dc_lock, same frame).
+	 * Captured during the plane loop for the primary plane.
+	 */
+	struct dc_plane_state *tiled_peer_plane = NULL;
+	struct dc_scaling_info tiled_peer_scaling = {0};
+	struct dc_surface_update tiled_peer_su = {0};
+	struct dc_stream_update tiled_peer_stream_update = {0};
+	int tiled_peer_idx = 0;
 
 	/* update planes when needed */
 	for_each_oldnew_plane_in_state(state, plane, old_plane_state, new_plane_state, i) {
@@ -10788,6 +11209,30 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 		bundle->surface_updates[planes_count].scaling_info =
 			&bundle->scaling_infos[planes_count];
 
+		/*
+		 * Tiled stitch: fill_dc_scaling_info() above derived a
+		 * full-width viewport from the drm plane. Split it: the root
+		 * plane shows the LEFT half, and the peer plane (captured
+		 * here) the RIGHT half of the same BO. Done every flip because
+		 * the scaling is recomputed every flip. The stream timing
+		 * carries the tile size (forced at stream creation).
+		 */
+		if (acrtc_state->stream_peer && dm_new_plane_state->dc_state_peer &&
+		    plane == pcrtc->primary && new_plane_state->fb &&
+		    new_plane_state->fb->width >=
+			    2 * acrtc_state->stream->timing.h_addressable) {
+			int tile_w = acrtc_state->stream->timing.h_addressable;
+			int tile_h = acrtc_state->stream->timing.v_addressable;
+
+			/* Copy first (keeps scaling_quality etc.), then reconcile
+			 * all rects (incl. clip) to tile stream space. */
+			tiled_peer_scaling = bundle->scaling_infos[planes_count];
+			tiled_stitch_set_scaling(&tiled_peer_scaling, tile_w,
+						 tile_w, tile_h);
+			tiled_stitch_set_scaling(&bundle->scaling_infos[planes_count],
+						 0, tile_w, tile_h);
+		}
+
 		plane_needs_flip = old_plane_state->fb && new_plane_state->fb;
 
 		pflip_present = pflip_present || plane_needs_flip;
@@ -10810,6 +11255,17 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 
 		bundle->surface_updates[planes_count].plane_info =
 			&bundle->plane_infos[planes_count];
+
+		/* Tiled stitch: capture the peer plane only on an actual flip, so
+		 * its reuse of this index's flip_addr/plane_info (just filled) is
+		 * valid. */
+		if (acrtc_state->stream_peer && dm_new_plane_state->dc_state_peer &&
+		    plane == pcrtc->primary && new_plane_state->fb &&
+		    new_plane_state->fb->width >=
+			    2 * acrtc_state->stream->timing.h_addressable) {
+			tiled_peer_plane = dm_new_plane_state->dc_state_peer;
+			tiled_peer_idx = planes_count;
+		}
 
 		if (acrtc_state->stream->link->psr_settings.psr_feature_enabled ||
 		    acrtc_state->stream->link->replay_settings.replay_feature_enabled) {
@@ -11029,6 +11485,41 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 					 acrtc_state->stream,
 					 &bundle->stream_update,
 					 bundle->surface_updates);
+
+		/*
+		 * Tiled stitch: flip the peer (right-tile) plane to the same
+		 * BO/frame on the peer stream, under the same dc_lock. Reuses
+		 * the root plane's flip_addr (same surface) and plane_info,
+		 * with the right-half viewport captured above.
+		 */
+		if (tiled_peer_plane && acrtc_state->stream_peer) {
+			/*
+				* dc_update_planes_and_stream() dereferences stream_update->stream
+				* unconditionally (NULL deref / Oops if unset). Point it at the
+				* peer stream; color commits also carry the peer stream's
+				* mirrored CRTC color state so the right tile is reprogrammed.
+				*/
+			tiled_peer_stream_update.stream = acrtc_state->stream_peer;
+			if (new_pcrtc_state->color_mgmt_changed) {
+				tiled_peer_stream_update.gamut_remap =
+					&acrtc_state->stream_peer->gamut_remap_matrix;
+				tiled_peer_stream_update.output_csc_transform =
+					&acrtc_state->stream_peer->csc_color_matrix;
+				tiled_peer_stream_update.out_transfer_func =
+					&acrtc_state->stream_peer->out_transfer_func;
+			}
+			tiled_peer_su.surface = tiled_peer_plane;
+			tiled_peer_su.scaling_info = &tiled_peer_scaling;
+			tiled_peer_su.flip_addr = &bundle->flip_addrs[tiled_peer_idx];
+			tiled_peer_su.plane_info = &bundle->plane_infos[tiled_peer_idx];
+
+			update_planes_and_stream_adapter(dm->dc,
+						 acrtc_state->update_type,
+						 1,
+						 acrtc_state->stream_peer,
+						 &tiled_peer_stream_update,
+						 &tiled_peer_su);
+		}
 		updated_planes_and_streams = true;
 
 		/**
@@ -11258,6 +11749,8 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 			mutex_lock(&dm->dc_lock);
 			dc_exit_ips_for_hw_access(dm->dc);
 			dc_stream_program_cursor_position(dm_old_crtc_state->stream, &position);
+			amdgpu_dm_tiled_program_peer_cursor(dm_old_crtc_state->stream_peer,
+							      NULL, &position);
 			mutex_unlock(&dm->dc_lock);
 		}
 
@@ -12271,6 +12764,62 @@ static void set_freesync_fixed_config(struct dm_crtc_state *dm_new_crtc_state)
 	dm_new_crtc_state->freesync_config.fixed_refresh_in_uhz = res;
 }
 
+/*
+ * Build the slave-tile (right) peer stream for a stitched dual-tile display.
+ * Both tiles share identical timing (confirmed at modeset), so we clone the
+ * already-validated root stream's timing/geometry onto the slave link's
+ * sink. The peer carries no drm connector (dm_stream_context = NULL); it
+ * rides the root crtc's vblank/flip. Returns a stream with one reference
+ * (the create ref), or NULL.
+ */
+static struct dc_stream_state *
+create_tiled_peer_stream(struct dc *dc, struct dc_state *context,
+			 struct dc_stream_state *root_stream)
+{
+	struct dc_link *peer_link;
+	struct dc_sink *sink;
+	struct dc_stream_state *peer;
+	int i;
+
+	if (!root_stream || !root_stream->link)
+		return NULL;
+
+	peer_link = root_stream->link->tiled_peer;
+	if (!peer_link || !peer_link->local_sink)
+		return NULL;
+
+	/*
+	 * Defensive: never create a second stream on the slave link. If one is
+	 * already present in this context (e.g. a transient boot/seamless slave
+	 * stream not yet torn down), skip -- a double stream on one link would
+	 * fail validation. The disable pass removes the slave crtc's stream
+	 * before this enable pass runs, so normally the link is free here.
+	 */
+	for (i = 0; context && i < context->stream_count; i++) {
+		if (context->streams[i] &&
+		    context->streams[i]->link == peer_link)
+			return NULL;
+	}
+
+	sink = peer_link->local_sink;
+	dc_sink_retain(sink);
+	peer = dc_create_stream_for_sink(sink);
+	dc_sink_release(sink);
+	if (!peer)
+		return NULL;
+
+	/* No drm connector backs the peer; it is internal to the root crtc. */
+	peer->dm_stream_context = NULL;
+
+	/* Both tiles are timing-identical; mirror the validated root stream. */
+	peer->timing = root_stream->timing;
+	peer->src = root_stream->src;
+	peer->dst = root_stream->dst;
+	peer->output_color_space = root_stream->output_color_space;
+
+	return peer;
+}
+
 static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
 			 struct drm_atomic_state *state,
 			 struct drm_crtc *crtc,
@@ -12294,6 +12843,8 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
 	struct amdgpu_dm_connector *aconnector = NULL;
 	struct drm_connector_state *drm_new_conn_state = NULL, *drm_old_conn_state = NULL;
 	struct dm_connector_state *dm_new_conn_state = NULL, *dm_old_conn_state = NULL;
+	bool tiled_stitch_logical_modeset = false;
+	int tile_w = 0, tile_h = 0;
 
 	new_stream = NULL;
 
@@ -12320,8 +12871,44 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
 		dm_new_conn_state = to_dm_connector_state(drm_new_conn_state);
 		dm_old_conn_state = to_dm_connector_state(drm_old_conn_state);
 
+		if (amdgpu_dm_tiled_stitch_has_live_root_stream(aconnector,
+								dm_old_crtc_state,
+								new_crtc_state)) {
+			drm_info(adev_to_drm(adev),
+				 "TILED_STITCH: accept logical root modeset without reprogramming connector=%s crtc=%d old=\"%s\" %dx%d clock=%d new=\"%s\" %dx%d clock=%d\n",
+				 connector->name, crtc->base.id,
+				 old_crtc_state->mode.name,
+				 old_crtc_state->mode.hdisplay,
+				 old_crtc_state->mode.vdisplay,
+				 old_crtc_state->mode.clock,
+				 new_crtc_state->mode.name,
+				 new_crtc_state->mode.hdisplay,
+				 new_crtc_state->mode.vdisplay,
+				 new_crtc_state->mode.clock);
+			tiled_stitch_logical_modeset = true;
+			new_crtc_state->mode_changed = false;
+			goto skip_modeset;
+		}
+
 		if (!drm_atomic_crtc_needs_modeset(new_crtc_state))
 			goto skip_modeset;
+
+		if (amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link) &&
+		    !amdgpu_dm_tiled_stitch_mode_is_stitched(connector,
+							     &new_crtc_state->mode)) {
+			amdgpu_dm_connector_tiled_stitch_geometry(connector,
+								  &tile_w, &tile_h);
+			drm_info(adev_to_drm(adev),
+				 "TILED_STITCH: atomic reject non-stitched root mode connector=%s crtc=%d mode=\"%s\" %dx%d clock=%d stitch_size=%ux%u\n",
+				 connector->name, crtc->base.id,
+				 new_crtc_state->mode.name,
+				 new_crtc_state->mode.hdisplay,
+				 new_crtc_state->mode.vdisplay,
+				 new_crtc_state->mode.clock,
+				 2 * tile_w, tile_h);
+			ret = -EINVAL;
+			goto fail;
+		}
 
 		new_stream = create_validate_stream_for_sink(connector,
 							     &new_crtc_state->mode,
@@ -12399,6 +12986,20 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
 		if (!dm_old_crtc_state->stream)
 			goto skip_modeset;
 
+		if (amdgpu_dm_tiled_stitch_has_live_root_stream(aconnector,
+								dm_old_crtc_state,
+								new_crtc_state)) {
+			drm_info(adev_to_drm(adev),
+				 "TILED_STITCH: keep live root stream for logical modeset connector=%s crtc=%d mode=\"%s\" %dx%d clock=%d\n",
+				 connector ? connector->name : "unknown",
+				 crtc->base.id,
+				 new_crtc_state->mode.name,
+				 new_crtc_state->mode.hdisplay,
+				 new_crtc_state->mode.vdisplay,
+				 new_crtc_state->mode.clock);
+			goto skip_modeset;
+		}
+
 		/*
 		 * APPLE5K: any CRTC-off transition of the tiled eDP must NOT remove the
 		 * stream from the DC context. mutter's "lock + esc" blank is a FULL
@@ -12469,6 +13070,23 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
 		dc_stream_release(dm_old_crtc_state->stream);
 		dm_new_crtc_state->stream = NULL;
 
+		/*
+		 * Tiled stitch: tear down the slave-tile peer stream
+		 * alongside the root (mirrors the root remove above). The
+		 * keep-stream gate ahead of this branch skips the whole removal
+		 * for a tiled CRTC-off, so the peer is only removed on a genuine
+		 * modeset/disable.
+		 */
+		if (dm_old_crtc_state->stream_peer) {
+			if (dc_state_remove_stream(dm->dc, dm_state->context,
+					dm_old_crtc_state->stream_peer) != DC_OK) {
+				ret = -EINVAL;
+				goto fail;
+			}
+			dc_stream_release(dm_old_crtc_state->stream_peer);
+			dm_new_crtc_state->stream_peer = NULL;
+		}
+
 		reset_freesync_config_for_crtc(dm_new_crtc_state);
 
 		*lock_and_validation_needed = true;
@@ -12500,6 +13118,87 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
 
 			drm_dbg_atomic(adev_to_drm(adev), "Enabling DRM crtc: %d\n",
 					 crtc->base.id);
+
+			/*
+			 * Tiled stitch instrumentation: for the stitched root,
+			 * dump the root stream timing and the slave peer link /
+			 * sink so the derived per-tile timing cloned onto the
+			 * peer stream can be confirmed, and how many streams
+			 * are already in the DC context. Read-only; root only.
+			 */
+			if (amdgpu_dm_link_is_tiled_stitch_root(new_stream->link)) {
+				struct dc_link *peer = new_stream->link->tiled_peer;
+				struct dc_crtc_timing *t = &new_stream->timing;
+
+				drm_info(adev_to_drm(adev),
+					 "TILED_STITCH: crtc=%d root link[%u] stream timing %ux%u total %ux%u pixclk_100hz=%u front_porch h=%u v=%u sync h=%u v=%u; ctx stream_count=%u\n",
+					 crtc->base.id, new_stream->link->link_index,
+					 t->h_addressable, t->v_addressable,
+					 t->h_total, t->v_total, t->pix_clk_100hz,
+					 t->h_front_porch, t->v_front_porch,
+					 t->h_sync_width, t->v_sync_width,
+					 dm_state->context->stream_count);
+				if (peer)
+					drm_info(adev_to_drm(adev),
+						 "TILED_STITCH: peer link[%u] signal=%d has_sink=%d\n",
+						 peer->link_index, peer->connector_signal,
+						 !!peer->local_sink);
+				else
+					drm_info(adev_to_drm(adev),
+						 "TILED_STITCH: no tiled_peer on root link[%u]\n",
+						 new_stream->link->link_index);
+			}
+
+			/*
+			 * Tiled stitch: drive the slave (right) tile from this
+			 * SAME root crtc as a peer stream, so one connector
+			 * presents the whole stitched panel and both tiles
+			 * commit together in one dc_commit_streams() (the Apple
+			 * panel TCON latches native only when both come up at
+			 * once). The peer is added to the same DC context, so
+			 * dc_commit_streams() brings up its pipe automatically.
+			 * Refcounting mirrors the root stream above exactly.
+			 * The root connector exposes only the stitched (2x tile)
+			 * mode; the size check is defensive against stale or
+			 * forced non-stitched modes.
+			 */
+			if (amdgpu_dm_link_is_tiled_stitch_root(new_stream->link) &&
+			    !dm_new_crtc_state->stream_peer &&
+			    new_crtc_state->mode.hdisplay ==
+				    2 * (int)new_stream->timing.h_addressable &&
+			    new_crtc_state->mode.vdisplay ==
+				    (int)new_stream->timing.v_addressable) {
+				struct dc_stream_state *peer =
+					create_tiled_peer_stream(dm->dc,
+						dm_state->context, new_stream);
+
+				if (peer) {
+					dm_new_crtc_state->stream_peer = peer;
+					dc_stream_retain(peer);
+
+					if (dc_state_add_stream(dm->dc,
+							dm_state->context, peer) != DC_OK) {
+						dm_new_crtc_state->stream_peer = NULL;
+						dc_stream_release(peer); /* crtc_state ref */
+						dc_stream_release(peer); /* create ref */
+						ret = -EINVAL;
+						goto fail;
+					}
+
+					/* Drop the local create ref; crtc_state + context hold one each. */
+					dc_stream_release(peer);
+
+					drm_info(adev_to_drm(adev),
+						 "TILED_STITCH: added peer slave-tile stream link[%u] %ux%u (one crtc drives both tiles); ctx stream_count=%u\n",
+						 peer->link ? peer->link->link_index : 0xffu,
+						 peer->timing.h_addressable,
+						 peer->timing.v_addressable,
+						 dm_state->context->stream_count);
+				} else {
+					drm_warn(adev_to_drm(adev),
+						 "TILED_STITCH: peer slave-tile stream NOT created (no peer sink?) -- right tile will be dark\n");
+				}
+			}
 
 			if (dc_state_add_stream(
 					dm->dc,
@@ -12535,8 +13234,9 @@ skip_modeset:
 	BUG_ON(dm_new_crtc_state->stream == NULL);
 
 	/* Scaling or underscan settings */
-	if (is_scaling_state_different(dm_old_conn_state, dm_new_conn_state) ||
-				drm_atomic_crtc_needs_modeset(new_crtc_state))
+	if (!tiled_stitch_logical_modeset &&
+	    (is_scaling_state_different(dm_old_conn_state, dm_new_conn_state) ||
+	     drm_atomic_crtc_needs_modeset(new_crtc_state)))
 		update_stream_scaling_settings(adev_to_drm(adev),
 			&new_crtc_state->mode, dm_new_conn_state, dm_new_crtc_state->stream);
 
@@ -12940,6 +13640,17 @@ static int dm_update_plane_state(struct dc *dc,
 
 		dm_new_plane_state->dc_state = NULL;
 
+		/* Tiled stitch: tear down the peer (right-tile) plane. */
+		if (dm_old_plane_state->dc_state_peer) {
+			if (dm_old_crtc_state->stream_peer &&
+			    !dc_state_remove_plane(dc, dm_old_crtc_state->stream_peer,
+						   dm_old_plane_state->dc_state_peer,
+						   dm_state->context))
+				return -EINVAL;
+			dc_plane_state_release(dm_old_plane_state->dc_state_peer);
+			dm_new_plane_state->dc_state_peer = NULL;
+		}
+
 		*lock_and_validation_needed = true;
 
 	} else { /* Add new planes */
@@ -13026,6 +13737,67 @@ static int dm_update_plane_state(struct dc *dc,
 		 * is a plane change. Inefficient, but works for now.
 		 */
 		dm_new_plane_state->dc_state->update_flags.bits.full_update = 1;
+
+		/*
+		 * Tiled stitch: the framebuffer is the full stitched surface
+		 * but each tile stream carries only one tile. Constrain this
+		 * (root) plane to the LEFT viewport and create a peer plane
+		 * for the RIGHT viewport on the crtc's peer stream, both into
+		 * the same GEM BO. (The flip path re-applies these viewports
+		 * on every page-flip.) Lifecycle mirrors dc_state exactly
+		 * (dup retains, destroy releases). stream_peer only exists
+		 * when the stitch gate passed at crtc-state time, so its
+		 * presence (plus a full-width fb) is the gate here.
+		 */
+		if (dm_new_crtc_state->stream_peer &&
+		    dm_new_crtc_state->stream &&
+		    new_plane_state->fb &&
+		    new_plane_state->fb->width >=
+			    2 * dm_new_crtc_state->stream->timing.h_addressable) {
+			int tile_w = dm_new_crtc_state->stream->timing.h_addressable;
+			int tile_h = dm_new_crtc_state->stream->timing.v_addressable;
+			struct dc_plane_state *peer_plane = dc_create_plane_state(dc);
+
+			if (!peer_plane) {
+				ret = -ENOMEM;
+				goto out;
+			}
+
+			ret = fill_dc_plane_attributes(
+				drm_to_adev(new_plane_crtc->dev),
+				peer_plane, new_plane_state, new_crtc_state);
+			if (ret) {
+				dc_plane_state_release(peer_plane);
+				goto out;
+			}
+
+			/* Root plane -> left half; peer plane -> right half. All
+			 * rects (incl. clip) reconciled to tile stream space. */
+			tiled_stitch_set_plane_rects(dc_new_plane_state, 0,
+						     tile_w, tile_h);
+			tiled_stitch_set_plane_rects(peer_plane, tile_w,
+						     tile_w, tile_h);
+			peer_plane->update_flags.bits.full_update = 1;
+
+			if (!dc_state_add_plane(dc, dm_new_crtc_state->stream_peer,
+						peer_plane, dm_state->context)) {
+				dc_plane_state_release(peer_plane);
+				ret = -EINVAL;
+				goto out;
+			}
+
+			dm_new_plane_state->dc_state_peer = peer_plane;
+
+			drm_info(new_plane_crtc->dev,
+				 "TILED_STITCH: plane split (modeset) root src(%d,%d %dx%d) dst(%d,%d %dx%d) clip(%dx%d); peer src.x=%d; root_stream=%p peer_stream=%p\n",
+				 dc_new_plane_state->src_rect.x, dc_new_plane_state->src_rect.y,
+				 dc_new_plane_state->src_rect.width, dc_new_plane_state->src_rect.height,
+				 dc_new_plane_state->dst_rect.x, dc_new_plane_state->dst_rect.y,
+				 dc_new_plane_state->dst_rect.width, dc_new_plane_state->dst_rect.height,
+				 dc_new_plane_state->clip_rect.width, dc_new_plane_state->clip_rect.height,
+				 peer_plane->src_rect.x,
+				 dm_new_crtc_state->stream, dm_new_crtc_state->stream_peer);
+		}
 
 		*lock_and_validation_needed = true;
 	}

@@ -899,6 +899,13 @@ struct dm_plane_state {
 	struct drm_plane_state base;
 	struct dc_plane_state *dc_state;
 
+	/*
+	 * Tiled stitch: the peer (right-tile) plane. Same GEM BO as @dc_state
+	 * but a right-half viewport (src_x = tile width), attached to the
+	 * crtc's peer stream. NULL on every non-stitched plane.
+	 */
+	struct dc_plane_state *dc_state_peer;
+
 	/* Plane color mgmt */
 	/**
 	 * @degamma_lut:
@@ -974,6 +981,17 @@ enum amdgpu_dm_cursor_mode {
 struct dm_crtc_state {
 	struct drm_crtc_state base;
 	struct dc_stream_state *stream;
+
+	/*
+	 * Tiled stitch: a stitched dual-tile panel (e.g. the Apple iMac 5K
+	 * panels) is two DP tiles. The root (left) tile is driven by @stream;
+	 * the slave (right) tile is driven by this peer stream, so one
+	 * drm_crtc presents the whole stitched panel to userspace. NULL on
+	 * every non-stitched crtc. Both streams are committed together in one
+	 * dc_commit_streams() so the Apple panel TCON latches native
+	 * dual-tile.
+	 */
+	struct dc_stream_state *stream_peer;
 
 	bool cm_has_degamma;
 	bool cm_is_degamma_srgb;
