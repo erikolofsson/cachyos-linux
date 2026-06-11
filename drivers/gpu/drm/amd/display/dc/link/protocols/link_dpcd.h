@@ -88,4 +88,16 @@ bool link_apple_5k_sample_panel_state(struct dc_link *root_link,
 				      const char *stage,
 				      struct apple5k_panel_state *state);
 
+/*
+ * Read the same register window off the slave tile's own AUX (log-only).
+ */
+void link_apple_5k_sample_slave_state(struct dc_link *slave_link,
+				      const char *stage);
+
+/*
+ * Armed-window bisect probe: log root + slave-own panel state at a named
+ * phase of the tiled pair's link bring-up. No-op when not arming.
+ */
+void link_apple_5k_lt_bisect(struct dc_link *link, const char *stage);
+
 #endif

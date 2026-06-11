@@ -319,6 +319,9 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 		 */
 		link_apple_5k_sample_panel_state(pipe->stream->link,
 						 "pre-unblank", NULL);
+		if (peer_pipe)
+			link_apple_5k_sample_slave_state(
+				peer_pipe->stream->link, "pre-unblank");
 
 		pipe->tiled_unblank_deferred = false;
 		dc->hwss.unblank_stream(pipe,
@@ -378,6 +381,9 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 		/* Final verdict; flips native_boot -> preservation on success. */
 		tiled_pair_sample_native_latch(pipe->stream->link,
 					       "post-unblank settle end");
+		if (peer_pipe)
+			link_apple_5k_sample_slave_state(
+				peer_pipe->stream->link, "settle end");
 		tiled_pair_log_link_health(pipe, peer_pipe, "settle end");
 		/*
 		 * NOTE: the failure "reset 0x4F1=0" is intentionally DISABLED.
@@ -2473,6 +2479,9 @@ static enum dc_status enable_link_dp(struct dc_state *state,
 
 			/* Diagnostic: panel mode state right after the arm. */
 			tiled_pair_sample_native_latch(link, "post re-arm");
+			if (link->tiled_peer)
+				link_apple_5k_sample_slave_state(
+					link->tiled_peer, "post re-arm");
 		}
 	}
 

@@ -476,7 +476,9 @@ enum link_training_result dp_perform_8b_10b_link_training(
 	}
 
 	if (status == LINK_TRAINING_SUCCESS) {
+		link_apple_5k_lt_bisect(link, "post-link-config");
 		status = perform_8b_10b_clock_recovery_sequence(link, link_res, lt_settings, DPRX);
+		link_apple_5k_lt_bisect(link, "post-CR");
 		if (status == LINK_TRAINING_SUCCESS) {
 			status = perform_8b_10b_channel_equalization_sequence(link,
 					link_res,
@@ -484,6 +486,7 @@ enum link_training_result dp_perform_8b_10b_link_training(
 					DPRX);
 			if (status == LINK_TRAINING_SUCCESS)
 				DC_LOG_HW_LINK_TRAINING("%s: Channel EQ done.\n", __func__);
+			link_apple_5k_lt_bisect(link, "post-EQ");
 		}
 	}
 

@@ -1656,6 +1656,8 @@ static enum link_training_result dp_transition_to_video_idle(
 {
 	union lane_count_set lane_count_set = {0};
 
+	link_apple_5k_lt_bisect(link, "pre-idle");
+
 	/* 4. mainlink output idle pattern*/
 	dp_set_hw_test_pattern(link, link_res, DP_TEST_PATTERN_VIDEO_MODE, NULL, 0);
 
@@ -1674,6 +1676,7 @@ static enum link_training_result dp_transition_to_video_idle(
 			if (!link->skip_fallback_on_link_loss)
 				status = dp_check_link_loss_status(link, lt_settings);
 		}
+		link_apple_5k_lt_bisect(link, "post-idle");
 		return status;
 	}
 
@@ -1856,6 +1859,7 @@ bool perform_link_training_with_retries(
 		DC_LOG_INFO("APPLE5K: pre-LT slave settle link[%u] (no D3 -- D3-while-armed is the suspected fault trigger)\n",
 			    link->link_index);
 	}
+	link_apple_5k_lt_bisect(link, "pre-train");
 
 	dp_trace_set_lt_start_timestamp(link, false);
 	j = 0;

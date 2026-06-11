@@ -311,6 +311,65 @@ bool link_apple_5k_sample_panel_state(struct dc_link *root_link,
 }
 
 /*
+ * Same register window read off the SLAVE tile's own AUX (tile1 has its own
+ * DPCD space which has never been observed during the armed window -- the
+ * TCON may expose per-tile state there that the root-side block doesn't).
+ * Log-only; no fault semantics assumed for the slave-side bytes.
+ */
+void link_apple_5k_sample_slave_state(struct dc_link *slave_link,
+				      const char *stage)
+{
+	uint8_t block[8] = { 0 };
+	uint8_t marker = 0;
+	uint8_t latch = 0;
+	enum dc_status status;
+	DC_LOGGER_INIT(slave_link->ctx->logger);
+
+	if (!dc_link_has_tiled_slave_panel_patch(slave_link))
+		return;
+
+	status = core_link_read_dpcd(slave_link,
+				     APPLE_5K_DPCD_ROOT_PANEL_STATUS_BLOCK,
+				     block, sizeof(block));
+	if (status != DC_OK) {
+		DC_LOG_INFO("APPLE5K: slave panel regs (%s) link[%u] AUX READ FAILED (status=%d)\n",
+			    stage, slave_link->link_index, status);
+		return;
+	}
+	core_link_read_dpcd(slave_link, APPLE_5K_DPCD_ROOT_PANEL_MODE_MARKER,
+			    &marker, sizeof(marker));
+	core_link_read_dpcd(slave_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
+			    &latch, sizeof(latch));
+	DC_LOG_INFO("APPLE5K: slave panel regs (%s) link[%u] 0x425=0x%02x 0x41C=0x%02x 0x4F1=0x%02x 0x423=0x%02x 0x424=0x%02x block=%8ph\n",
+		    stage, slave_link->link_index, block[5], marker, latch,
+		    block[3], block[4], block);
+}
+
+/*
+ * Link-training bisect probe: during the armed window, snapshot the panel
+ * state (root block + slave-own block) at a named phase of the tiled pair's
+ * bring-up. The TCON faults somewhere inside tile1's training -- these
+ * samples find the exact phase. No-op outside the armed window.
+ */
+void link_apple_5k_lt_bisect(struct dc_link *link, const char *stage)
+{
+	struct dc_link *root = NULL;
+
+	if (!dc_link_apple5k_arming(link))
+		return;
+	if (dc_link_has_tiled_root_panel_patch(link))
+		root = link;
+	else if (link && dc_link_has_tiled_root_panel_patch(link->tiled_peer))
+		root = link->tiled_peer;
+	if (!root)
+		return;
+
+	link_apple_5k_sample_panel_state(root, stage, NULL);
+	if (link != root)
+		link_apple_5k_sample_slave_state(link, stage);
+}
+
+/*
  * The EFI ComplexDisplayInit arm handshake, RE'd instruction-level from
  * CoreEG2 fcn.00017cf1 (J137 firmware): the panel presents its BASE identity
  * (AE1D, EDID product LSB & 3 == 1) or its TILED identity (AE1E, LSB & 3 ==
