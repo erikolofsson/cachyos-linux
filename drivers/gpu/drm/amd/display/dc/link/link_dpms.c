@@ -92,12 +92,15 @@ static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 		return;
 
 	/*
-	 * An EFI-native-booted iMac Pro panel must never see the 0x4F1 re-pulse
-	 * (it can re-latch the TCON out of native). 0x425 is sampled at the
-	 * first root latch pulse during link detection, which always precedes
-	 * stream enable, so preserve() is decided by now.
+	 * The stream-enable re-pulse is the slave bring-up mechanism for the
+	 * OTHER tiled iMac models. The iMac Pro firmware writes no 0x4F1
+	 * during the mode-set (the RE'd ComplexDisplayInit arms once BEFORE
+	 * programming), and a mid-enable write can re-latch/wedge its TCON --
+	 * skip on iMacPro1,1 in both boot modes. The compat-boot arm happens
+	 * before root link training in enable_link_dp() instead.
 	 */
-	if (dc_link_apple5k_preserve(link))
+	if (link->apple5k_imac_pro ||
+	    (link->tiled_peer && link->tiled_peer->apple5k_imac_pro))
 		return;
 
 	DC_LOGGER_INIT(link->ctx->logger);
@@ -148,6 +151,42 @@ static struct pipe_ctx *get_tiled_peer_pipe(struct dc_state *state,
 	}
 
 	return NULL;
+}
+
+#define APPLE_5K_DPCD_PANEL_MODE_STATUS 0x425
+
+/*
+ * After a combined dual-tile enable, re-sample the root panel mode status
+ * (DPCD 0x425, bit1 set = compat) to learn whether the TCON latched native
+ * dual-tile mode. On a compat boot that just latched, flip
+ * apple5k_native_boot so the preservation paths (keep-stream-on-blank, slave
+ * skip-retrain, no 0x4F1 re-latch) protect the freshly latched state exactly
+ * like an EFI-native handoff -- otherwise the next blank/probe churn drives
+ * a tile solo and drops the panel back to compat.
+ */
+static void tiled_pair_sample_native_latch(struct dc_link *root_link)
+{
+	uint8_t mode = 0;
+	enum dc_status status;
+	bool native;
+	DC_LOGGER_INIT(root_link->ctx->logger);
+
+	if (!dc_link_has_tiled_root_panel_patch(root_link))
+		return;
+
+	status = core_link_read_dpcd(root_link,
+				     APPLE_5K_DPCD_PANEL_MODE_STATUS,
+				     &mode, sizeof(mode));
+	native = status == DC_OK && !(mode & 0x02);
+	DC_LOG_INFO("APPLE5K: post joint-unblank panel mode link[%u] status=%d 0x425=0x%02x -> %s (native_boot was %d)\n",
+		    root_link->link_index, status, mode,
+		    native ? "NATIVE" : "compat",
+		    root_link->apple5k_native_boot);
+
+	if (native && !root_link->apple5k_native_boot) {
+		root_link->apple5k_native_boot = true;
+		DC_LOG_INFO("APPLE5K: panel latched native after combined enable -- preservation paths now active\n");
+	}
 }
 
 void link_blank_all_dp_displays(struct dc *dc)
@@ -2115,6 +2154,8 @@ static enum dc_status enable_link_dp(struct dc_state *state,
 	bool do_fallback = false;
 	int lt_attempts = LINK_TRAINING_ATTEMPTS;
 
+	DC_LOGGER_INIT(link->ctx->logger);
+
 	// Increase retry count if attempting DP1.x on FIXED_VS link
 	if (((link->chip_caps & AMD_EXT_DISPLAY_PATH_CAPS__EXT_CHIP_MASK) == AMD_EXT_DISPLAY_PATH_CAPS__DP_FIXED_VS_EN) &&
 			link_dp_get_encoding_format(link_settings) == DP_8b_10b_ENCODING)
@@ -2154,6 +2195,25 @@ static enum dc_status enable_link_dp(struct dc_state *state,
 		if (!link->dc->config.edp_no_power_sequencing)
 			link->dc->hwss.edp_power_control(link, true);
 		link->dc->hwss.edp_wait_for_hpd_ready(link, true);
+
+		/*
+		 * Apple tiled root: the panel VDD may just have been power
+		 * cycled (boot-state teardown), which can drop the 0x4F1-armed
+		 * dual-tile state set at detection. Re-arm before link
+		 * training, exactly like the EFI firmware's ComplexDisplayInit
+		 * (0x4F1 -> 10 ms -> program/train/enable). No-op for
+		 * non-tiled roots; skipped on a preserved native boot (the
+		 * pulse helper never writes when the panel booted native).
+		 */
+		if (dc_link_has_tiled_root_panel_patch(link) &&
+		    !dc_link_apple5k_preserve(link)) {
+			enum dc_status arm_status =
+				link_apple_5k_root_panel_latch_pulse(link);
+
+			msleep(10);
+			DC_LOG_INFO("APPLE5K: re-armed root 0x4F1 after eDP power-on, before training link[%u] status=%d\n",
+				    link->link_index, arm_status);
+		}
 	}
 
 	if (link_dp_get_encoding_format(link_settings) == DP_128b_132b_ENCODING) {
@@ -2776,7 +2836,10 @@ void link_set_dpms_on(
 			    link->link_index,
 			    tiled_peer_pipe->stream->link->link_index);
 	} else {
-		if (tiled_peer_pipe && tiled_peer_pipe->tiled_unblank_deferred) {
+		bool tiled_joint = tiled_peer_pipe &&
+				   tiled_peer_pipe->tiled_unblank_deferred;
+
+		if (tiled_joint) {
 			/* Second tile of the pair: light both together. */
 			tiled_peer_pipe->tiled_unblank_deferred = false;
 			dc->hwss.unblank_stream(tiled_peer_pipe,
@@ -2787,6 +2850,14 @@ void link_set_dpms_on(
 		}
 		dc->hwss.unblank_stream(pipe_ctx,
 			&pipe_ctx->stream->link->cur_link_settings);
+
+		if (tiled_joint) {
+			/* Give the TCON a beat, then check whether it latched. */
+			msleep(20);
+			tiled_pair_sample_native_latch(
+				link->tiled_role == DC_TILED_ROLE_ROOT ?
+					link : link->tiled_peer);
+		}
 	}
 
 	if (stream->sink_patches.delay_ignore_msa > 0)

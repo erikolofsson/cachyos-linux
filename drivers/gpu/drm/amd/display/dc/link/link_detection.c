@@ -1478,6 +1478,21 @@ static bool detect_link_and_local_sink(struct dc_link *link,
 		    sink_caps.transaction_type ==
 		    DDC_TRANSACTION_TYPE_I2C_OVER_AUX) {
 			/*
+			 * Tiled-pair slave: when the EDID is unchanged, reuse
+			 * the existing sink like the non-AUX path below does.
+			 * Otherwise every re-probe replaces the dc_sink, fires
+			 * a hotplug event, and the compositor's re-commit
+			 * re-enables the slave tile solo -- which drops the
+			 * panel TCON out of native dual-tile mode.
+			 */
+			if (same_edid &&
+			    (dc_link_has_tiled_slave_panel_patch(link) ||
+			     link->tiled_role == DC_TILED_ROLE_SLAVE)) {
+				link_disconnect_remap(prev_sink, link);
+				sink = prev_sink;
+				prev_sink = NULL;
+			}
+			/*
 			 * TODO debug why certain monitors don't like
 			 *  two link trainings
 			 */

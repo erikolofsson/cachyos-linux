@@ -13123,6 +13123,14 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
 						 new_stream->link->link_index);
 			}
 
+			if (dc_state_add_stream(
+					dm->dc,
+					dm_state->context,
+					dm_new_crtc_state->stream) != DC_OK) {
+				ret = -EINVAL;
+				goto fail;
+			}
+
 			/*
 			 * Tiled stitch: drive the slave (right) tile from this
 			 * SAME root crtc as a peer stream, so one connector
@@ -13131,10 +13139,13 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
 			 * panel TCON latches native only when both come up at
 			 * once). The peer is added to the same DC context, so
 			 * dc_commit_streams() brings up its pipe automatically.
-			 * Refcounting mirrors the root stream above exactly.
-			 * Only when the crtc mode is the stitched (2x tile)
-			 * mode -- a user-selected per-tile mode drives the root
-			 * tile alone.
+			 * Added AFTER the root stream so the root gets the
+			 * lower pipe index and is trained/unblanked first --
+			 * the EFI firmware's ComplexDisplayInit order (tile 0,
+			 * then tile 1). Refcounting mirrors the root stream
+			 * above exactly. Only when the crtc mode is the
+			 * stitched (2x tile) mode -- a user-selected per-tile
+			 * mode drives the root tile alone.
 			 */
 			if (amdgpu_dm_link_is_tiled_stitch_root(new_stream->link) &&
 			    !dm_new_crtc_state->stream_peer &&
@@ -13172,14 +13183,6 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
 					drm_warn(adev_to_drm(adev),
 						 "TILED_STITCH: peer slave-tile stream NOT created (no peer sink?) -- right tile will be dark\n");
 				}
-			}
-
-			if (dc_state_add_stream(
-					dm->dc,
-					dm_state->context,
-					dm_new_crtc_state->stream) != DC_OK) {
-				ret = -EINVAL;
-				goto fail;
 			}
 
 			*lock_and_validation_needed = true;
