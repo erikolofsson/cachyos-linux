@@ -2802,6 +2802,39 @@ static inline bool dc_link_apple5k_preserve(const struct dc_link *link)
 	return root && root->apple5k_imac_pro && root->apple5k_native_boot;
 }
 
+/*
+ * APPLE5K: true while a compat-boot arm handshake is in progress on the tiled
+ * pair (latch armed, combined dual-tile enable not yet committed). Resolved via
+ * the root link so a slave link reports its pair's state too.
+ */
+static inline bool dc_link_apple5k_arming(const struct dc_link *link)
+{
+	const struct dc_link *root = NULL;
+
+	if (dc_link_has_tiled_root_panel_patch(link))
+		root = link;
+	else if (link && dc_link_has_tiled_root_panel_patch(link->tiled_peer))
+		root = link->tiled_peer;
+
+	return root && root->apple5k_imac_pro && root->apple5k_arming;
+}
+
+/*
+ * APPLE5K: the tiled panel TCON must not be disturbed -- EITHER because the
+ * panel booted native and we preserve it, OR because a compat-boot arm is in
+ * progress and the latch must survive to the combined enable. The SAME
+ * link-disrupting actions re-latch a native panel to compat and reset the arm
+ * latch: boot blank/lttpr, dp_blank, disable_output/PHY-disable, eDP VDD
+ * power-off, link retrain. Gate every one of those on this predicate so the
+ * arming window is protected exactly like the native-preserve path. The
+ * OTG/stream programming and the combined enable are NOT disrupting and still
+ * run.
+ */
+static inline bool dc_link_apple5k_protect(const struct dc_link *link)
+{
+	return dc_link_apple5k_preserve(link) || dc_link_apple5k_arming(link);
+}
+
 static inline bool dc_link_needs_tiled_slave_root_wake(const struct dc_link *link)
 {
 	const struct dc_panel_patch *patch;

@@ -327,7 +327,7 @@ void link_blank_all_dp_displays(struct dc *dc)
 		/* APPLE5K: skip ALL boot-cleanup link touches for the iMac Pro's native
 		 * tiled panel -- dp_retrieve_lttpr_cap() writes DP_PHY_REPEATER_MODE and
 		 * re-latches the firmware-native panel to compat. Preserve it. */
-		if (dc_link_apple5k_preserve(dc->links[i]))
+		if (dc_link_apple5k_protect(dc->links[i]))
 			continue;
 
 		/* DP 2.0 spec requires that we read LTTPR caps first */
@@ -355,7 +355,7 @@ void link_blank_all_edp_displays(struct dc *dc)
 
 		/* APPLE5K: preserve the iMac Pro's firmware-native tiled root -- skip
 		 * boot cleanup so it isn't re-latched to compat. */
-		if (dc_link_apple5k_preserve(dc->links[i]))
+		if (dc_link_apple5k_protect(dc->links[i]))
 			continue;
 
 		/* if any of the displays are lit up turn them off */
@@ -377,7 +377,7 @@ void link_blank_dp_stream(struct dc_link *link, bool hw_init)
 	 * do NOT blank/power-down the tiled root/slave streams during boot cleanup,
 	 * since that resets the latched panel TCON to compat. Runtime display-off
 	 * goes through dce110_blank_stream, not here. */
-	if (dc_link_apple5k_preserve(link))
+	if (dc_link_apple5k_protect(link))
 		return;
 
 	if ((signal == SIGNAL_TYPE_EDP) ||
@@ -2170,6 +2170,21 @@ static void disable_link(struct dc_link *link,
 		const struct link_resource *link_res,
 		enum signal_type signal)
 {
+	/*
+	 * APPLE5K: never disable the tiled panel's PHY/transmitter while the
+	 * panel is native-preserved OR a compat-boot arm is in progress.
+	 * dp_disable_link_phy()/disable_link_output() (and the eDP VDD power-off
+	 * inside disable_link_dp) re-latch the TCON to compat -- they reset a
+	 * native panel and reset the arm latch before the combined enable. Ride
+	 * the EFI-trained link instead (the modeset only reprograms the OTG).
+	 */
+	if (dc_link_apple5k_protect(link)) {
+		DC_LOGGER_INIT(link->ctx->logger);
+		DC_LOG_INFO("APPLE5K: skip disable_link for tiled link[%u] (protect: preserve/arming) -- no PHY/output disable, latch survives\n",
+			    link->link_index);
+		return;
+	}
+
 	if (dc_is_dp_signal(signal)) {
 		disable_link_dp(link, link_res, signal);
 	} else if (signal == SIGNAL_TYPE_VIRTUAL) {
@@ -2668,7 +2683,14 @@ void link_set_dpms_off(struct pipe_ctx *pipe_ctx)
 	dc->hwss.disable_audio_stream(pipe_ctx);
 
 	update_psp_stream_config(pipe_ctx, true);
-	dc->hwss.blank_stream(pipe_ctx);
+	/*
+	 * APPLE5K: dce110_blank_stream() does the dp_blank that re-latches the
+	 * tiled TCON to compat. Skip it while preserving native or arming (the
+	 * OTG is still freed by disable_stream below); the runtime display-off
+	 * backlight path is handled separately via dc_apple5k_tiled_panel_blank.
+	 */
+	if (!dc_link_apple5k_protect(link))
+		dc->hwss.blank_stream(pipe_ctx);
 
 	if (pipe_ctx->link_config.dp_tunnel_settings.should_use_dp_bw_allocation)
 		deallocate_usb4_bandwidth(pipe_ctx->stream);
