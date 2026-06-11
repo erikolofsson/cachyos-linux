@@ -153,6 +153,10 @@ struct link_service {
 	/*************************** DPMS *************************************/
 	void (*set_dpms_on)(struct dc_state *state, struct pipe_ctx *pipe_ctx);
 	void (*set_dpms_off)(struct pipe_ctx *pipe_ctx);
+	/* Light a dual-tile pair deferred through apply_ctx_to_hw() after
+	 * program_timing_sync() has phase-aligned the still-blanked OTGs. */
+	void (*tiled_pair_post_sync_unblank)(struct dc *dc,
+			struct dc_state *context);
 	void (*resume)(struct dc_link *link);
 	void (*blank_all_dp_displays)(struct dc *dc);
 	void (*blank_all_edp_displays)(struct dc *dc);

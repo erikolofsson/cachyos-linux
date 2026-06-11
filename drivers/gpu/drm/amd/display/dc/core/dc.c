@@ -2235,6 +2235,15 @@ static enum dc_status dc_commit_state_no_check(struct dc *dc, struct dc_state *c
 
 	dc_trigger_sync(dc, context);
 
+	/*
+	 * Tiled pair: the two tile pipes' unblanks were deferred through
+	 * apply_ctx_to_hw() so the panel never sees a solo or phase-unaligned
+	 * tile; now that program_timing_sync() has aligned the OTGs, light
+	 * both tiles together (root first -- the firmware's combined-enable
+	 * order).
+	 */
+	dc->link_srv->tiled_pair_post_sync_unblank(dc, context);
+
 	/* Full update should unconditionally be triggered when dc_commit_state_no_check is called */
 	for (i = 0; i < context->stream_count; i++) {
 		uint32_t prev_dsc_changed = context->streams[i]->update_flags.bits.dsc_changed;

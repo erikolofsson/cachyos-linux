@@ -153,21 +153,26 @@ static struct pipe_ctx *get_tiled_peer_pipe(struct dc_state *state,
 	return NULL;
 }
 
+#define APPLE_5K_DPCD_PANEL_MODE_MARKER 0x41C
 #define APPLE_5K_DPCD_PANEL_MODE_STATUS 0x425
 
 /*
  * After a combined dual-tile enable, re-sample the root panel mode status
  * (DPCD 0x425, bit1 set = compat) to learn whether the TCON latched native
- * dual-tile mode. On a compat boot that just latched, flip
- * apple5k_native_boot so the preservation paths (keep-stream-on-blank, slave
- * skip-retrain, no 0x4F1 re-latch) protect the freshly latched state exactly
- * like an EFI-native handoff -- otherwise the next blank/probe churn drives
- * a tile solo and drops the panel back to compat.
+ * dual-tile mode. 0x41C (native marker, bit4 -- self-asserted by the panel
+ * with a delay) and 0x4F1 (the latch) are read alongside for diagnostics.
+ * On a compat boot that just latched, flip apple5k_native_boot so the
+ * preservation paths (keep-stream-on-blank, slave skip-retrain, no 0x4F1
+ * re-latch) protect the freshly latched state exactly like an EFI-native
+ * handoff -- otherwise the next blank/probe churn drives a tile solo and
+ * drops the panel back to compat.
  */
 static void tiled_pair_sample_native_latch(struct dc_link *root_link,
 					   const char *stage)
 {
 	uint8_t mode = 0;
+	uint8_t marker = 0;
+	uint8_t latch = 0;
 	enum dc_status status;
 	bool native;
 	DC_LOGGER_INIT(root_link->ctx->logger);
@@ -178,15 +183,63 @@ static void tiled_pair_sample_native_latch(struct dc_link *root_link,
 	status = core_link_read_dpcd(root_link,
 				     APPLE_5K_DPCD_PANEL_MODE_STATUS,
 				     &mode, sizeof(mode));
+	core_link_read_dpcd(root_link, APPLE_5K_DPCD_PANEL_MODE_MARKER,
+			    &marker, sizeof(marker));
+	core_link_read_dpcd(root_link, APPLE_5K_DPCD_PANEL_LATCH,
+			    &latch, sizeof(latch));
 	native = status == DC_OK && !(mode & 0x02);
-	DC_LOG_INFO("APPLE5K: panel mode (%s) link[%u] status=%d 0x425=0x%02x -> %s (native_boot was %d)\n",
-		    stage, root_link->link_index, status, mode,
+	DC_LOG_INFO("APPLE5K: panel mode (%s) link[%u] status=%d 0x425=0x%02x 0x41C=0x%02x 0x4F1=0x%02x -> %s (native_boot was %d)\n",
+		    stage, root_link->link_index, status, mode, marker, latch,
 		    native ? "NATIVE" : "compat",
 		    root_link->apple5k_native_boot);
 
 	if (native && !root_link->apple5k_native_boot) {
 		root_link->apple5k_native_boot = true;
 		DC_LOG_INFO("APPLE5K: panel latched native after combined enable -- preservation paths now active\n");
+	}
+}
+
+/*
+ * Light a dual-tile pair whose unblanks were deferred through
+ * apply_ctx_to_hw(). Called from dc_commit_state_no_check() right after
+ * program_timing_sync() has phase-aligned the still-blanked OTGs, so the
+ * panel's first dual-tile video is coherent: root tile first, slave tile
+ * back-to-back -- the EFI firmware's combined-enable order. Then sample the
+ * panel mode to learn whether the TCON latched native.
+ */
+void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
+{
+	int i;
+	DC_LOGGER_INIT(dc->ctx->logger);
+
+	for (i = 0; i < MAX_PIPES; i++) {
+		struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
+		struct pipe_ctx *peer_pipe;
+
+		if (!pipe->stream || !pipe->tiled_unblank_deferred)
+			continue;
+		if (pipe->stream->link->tiled_role != DC_TILED_ROLE_ROOT)
+			continue; /* handle each pair once, root first */
+
+		peer_pipe = get_tiled_peer_pipe(context, pipe);
+
+		pipe->tiled_unblank_deferred = false;
+		dc->hwss.unblank_stream(pipe,
+			&pipe->stream->link->cur_link_settings);
+		if (peer_pipe && peer_pipe->tiled_unblank_deferred) {
+			peer_pipe->tiled_unblank_deferred = false;
+			dc->hwss.unblank_stream(peer_pipe,
+				&peer_pipe->stream->link->cur_link_settings);
+		}
+
+		DC_LOG_INFO("APPLE5K: post-sync joint unblank tiled pair link[%u] + link[%d]\n",
+			    pipe->stream->link->link_index,
+			    peer_pipe ? (int)peer_pipe->stream->link->link_index : -1);
+
+		/* Give the TCON a beat, then check whether it latched. */
+		msleep(20);
+		tiled_pair_sample_native_latch(pipe->stream->link,
+					       "post-sync joint unblank");
 	}
 }
 
@@ -2835,10 +2888,12 @@ void link_set_dpms_on(
 	 * driven solo drops it to single-tile compat. If the peer tile is
 	 * enabled later in this same pass (comes after us in pipe order, link
 	 * not yet trained, and not a seamless/fast-boot pipe that skips its
-	 * unblank), defer this unblank; the peer's set_dpms_on() then unblanks
-	 * both back-to-back. dce110_apply_ctx_to_hw() unblanks any pipe left
-	 * deferred (peer enable failed or bailed early), so a miss degrades to
-	 * the old solo-lighting order instead of a dark tile. For eDP the
+	 * unblank), defer this unblank; the peer's set_dpms_on() then defers
+	 * itself too and the pair is lit together AFTER program_timing_sync()
+	 * has phase-aligned the OTGs (link_tiled_pair_post_sync_unblank()).
+	 * dce110_apply_ctx_to_hw() unblanks any ORPHANED deferred pipe (peer
+	 * enable failed or bailed early), so a miss degrades to the old
+	 * solo-lighting order instead of a dark tile. For eDP the
 	 * backlight-on rides inside unblank_stream and is deferred with it.
 	 */
 	tiled_peer_pipe = get_tiled_peer_pipe(state, pipe_ctx);
@@ -2851,30 +2906,25 @@ void link_set_dpms_on(
 		DC_LOG_INFO("APPLE5K: defer unblank link[%u] until tiled peer link[%u] trains (no solo tile)\n",
 			    link->link_index,
 			    tiled_peer_pipe->stream->link->link_index);
+	} else if (tiled_peer_pipe && tiled_peer_pipe->tiled_unblank_deferred) {
+		/*
+		 * Second tile of the pair: both links are trained now, but the
+		 * two OTGs are still at ARBITRARY phase relative to each other
+		 * (they were enabled hundreds of ms apart), and dc only
+		 * phase-aligns them in program_timing_sync(), which runs after
+		 * apply_ctx_to_hw(). Defer THIS unblank too: the pair is lit
+		 * together in link_tiled_pair_post_sync_unblank(), right after
+		 * the sync has aligned the still-blanked OTGs. Unaligned tiles
+		 * read as incoherent dual-tile video and the panel TCON
+		 * refuses the native latch (the EFI firmware programs both
+		 * OTGs in ONE combined config, so they start aligned).
+		 */
+		pipe_ctx->tiled_unblank_deferred = true;
+		DC_LOG_INFO("APPLE5K: defer unblank link[%u] too -- pair lights together after OTG phase sync\n",
+			    link->link_index);
 	} else {
-		bool tiled_joint = tiled_peer_pipe &&
-				   tiled_peer_pipe->tiled_unblank_deferred;
-
-		if (tiled_joint) {
-			/* Second tile of the pair: light both together. */
-			tiled_peer_pipe->tiled_unblank_deferred = false;
-			dc->hwss.unblank_stream(tiled_peer_pipe,
-				&tiled_peer_pipe->stream->link->cur_link_settings);
-			DC_LOG_INFO("APPLE5K: joint unblank tiled pair link[%u] + link[%u]\n",
-				    tiled_peer_pipe->stream->link->link_index,
-				    link->link_index);
-		}
 		dc->hwss.unblank_stream(pipe_ctx,
 			&pipe_ctx->stream->link->cur_link_settings);
-
-		if (tiled_joint) {
-			/* Give the TCON a beat, then check whether it latched. */
-			msleep(20);
-			tiled_pair_sample_native_latch(
-				link->tiled_role == DC_TILED_ROLE_ROOT ?
-					link : link->tiled_peer,
-				"post joint-unblank");
-		}
 	}
 
 	if (stream->sink_patches.delay_ignore_msa > 0)

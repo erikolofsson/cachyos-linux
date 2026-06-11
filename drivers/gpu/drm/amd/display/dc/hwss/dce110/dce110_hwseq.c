@@ -2562,20 +2562,41 @@ enum dc_status dce110_apply_ctx_to_hw(
 	}
 
 	/*
-	 * Dual-tile pair safety net: unblank any pipe whose unblank was
-	 * deferred by link_set_dpms_on() waiting for its tile-pair peer, but
-	 * whose peer never reached its own unblank (enable failure or an
-	 * early-out path). Solo lighting (the old behaviour) beats leaving
-	 * the tile dark.
+	 * Dual-tile pair safety net: unblank any ORPHANED deferred pipe -- one
+	 * whose tile-pair peer never reached its own unblank decision (enable
+	 * failure or an early-out path). Solo lighting (the old behaviour)
+	 * beats leaving the tile dark. A pair where BOTH pipes are deferred is
+	 * intentional: it is lit together by
+	 * link_tiled_pair_post_sync_unblank() right after
+	 * program_timing_sync() has phase-aligned the OTGs
+	 * (dc_commit_state_no_check, the only caller of this function).
 	 */
 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
 		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
+		struct dc_link *peer_link;
+		bool pair_deferred = false;
+		int j;
 
-		if (pipe_ctx->stream && pipe_ctx->tiled_unblank_deferred) {
-			pipe_ctx->tiled_unblank_deferred = false;
-			dc->hwss.unblank_stream(pipe_ctx,
-				&pipe_ctx->stream->link->cur_link_settings);
+		if (!pipe_ctx->stream || !pipe_ctx->tiled_unblank_deferred)
+			continue;
+
+		peer_link = pipe_ctx->stream->link->tiled_peer;
+		for (j = 0; peer_link && j < dc->res_pool->pipe_count; j++) {
+			struct pipe_ctx *p = &context->res_ctx.pipe_ctx[j];
+
+			if (p->stream && p->stream->link == peer_link &&
+			    p->tiled_unblank_deferred) {
+				pair_deferred = true;
+				break;
+			}
 		}
+
+		if (pair_deferred)
+			continue;
+
+		pipe_ctx->tiled_unblank_deferred = false;
+		dc->hwss.unblank_stream(pipe_ctx,
+			&pipe_ctx->stream->link->cur_link_settings);
 	}
 
 	if (dc->fbc_compressor)
