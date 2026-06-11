@@ -1787,6 +1787,22 @@ static void apple5k_log_tiled_lt_result(struct dc_link *link,
 		    settings->link_rate, settings->lane_count,
 		    lane_status[0], lane_status[1], lane_status[2],
 		    lane_status[3], lane_status[4], lane_status[5]);
+
+	/*
+	 * Bisect sample: does the TCON fault bit (0x424[2]) appear at a
+	 * specific training event (e.g. the slave's attempt-1 link loss and
+	 * the D3 power-down that follows it) or only later at the unblank?
+	 */
+	{
+		struct dc_link *root = NULL;
+
+		if (dc_link_has_tiled_root_panel_patch(link))
+			root = link;
+		else if (dc_link_has_tiled_root_panel_patch(link->tiled_peer))
+			root = link->tiled_peer;
+		if (root)
+			link_apple_5k_sample_panel_state(root, "post-LT", NULL);
+	}
 }
 
 bool perform_link_training_with_retries(
@@ -1820,6 +1836,26 @@ bool perform_link_training_with_retries(
 		 * pattern in SST mode will be sent right after the link training
 		 */
 		link_hwss->setup_stream_encoder(pipe_ctx);
+
+	/*
+	 * APPLE5K: armed tiled slave -- the first training attempt after the
+	 * arm consistently trains and then immediately drops lock
+	 * (LINK_TRAINING_LINK_LOSS, interlane align lost), and only the retry
+	 * that follows dp_disable_link_phy's sink D3 + PHY power cycle holds.
+	 * Replicate that winning precondition BEFORE the first attempt (sink
+	 * to D3, settle; attempt 1's dp_enable_link_phy restores D0) so
+	 * attempt 1 trains clean and the armed window stays free of the
+	 * fail -> power-down -> retrain churn the firmware never produces.
+	 */
+	if (dc_link_apple5k_arming(link) &&
+	    dc_link_has_tiled_slave_panel_patch(link)) {
+		uint8_t power = DP_SET_POWER_D3;
+
+		core_link_write_dpcd(link, DP_SET_POWER, &power, sizeof(power));
+		msleep(20);
+		DC_LOG_INFO("APPLE5K: pre-LT slave sink power cycle link[%u] (D3 now, D0 at attempt 1)\n",
+			    link->link_index);
+	}
 
 	dp_trace_set_lt_start_timestamp(link, false);
 	j = 0;

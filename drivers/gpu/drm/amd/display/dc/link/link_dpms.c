@@ -311,6 +311,15 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 
 		peer_pipe = get_tiled_peer_pipe(context, pipe);
 
+		/*
+		 * Bisect sample: panel state right before first video. If the
+		 * TCON fault is already set here, the training/teardown phase
+		 * caused it; if it appears only in the post-unblank sample,
+		 * the TCON is rejecting the video/enable itself.
+		 */
+		link_apple_5k_sample_panel_state(pipe->stream->link,
+						 "pre-unblank", NULL);
+
 		pipe->tiled_unblank_deferred = false;
 		dc->hwss.unblank_stream(pipe,
 			&pipe->stream->link->cur_link_settings);
