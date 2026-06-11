@@ -763,6 +763,17 @@ struct amdgpu_dm_connector {
 	uint32_t connector_id;
 	int bl_idx;
 
+	/*
+	 * Tiled stitch root: per-tile geometry captured from the DisplayID tile
+	 * block while connector->has_tile was still live. Kept so the stitch
+	 * helpers (mode synthesis, timing force, plane split) keep working after
+	 * has_tile is hidden -- has_tile is cleared so neither userspace nor the
+	 * kernel fbconsole (drm_client) drives the root at the per-tile size.
+	 * Zero until captured / on a non-stitch connector.
+	 */
+	int tiled_stitch_tile_w;
+	int tiled_stitch_tile_h;
+
 	struct cec_notifier *notifier;
 
 	/* we need to mind the EDID between detect

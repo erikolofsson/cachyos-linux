@@ -282,24 +282,14 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 
 		/* Give the TCON a beat, then check whether it latched. */
 		msleep(20);
-		if (!tiled_pair_sample_native_latch(pipe->stream->link,
-						    "post-sync joint unblank") &&
-		    pipe->stream->link->apple5k_imac_pro) {
-			uint8_t zero = 0;
-
-			/*
-			 * Latch attempt failed: reset 0x4F1 so the panel is
-			 * left exactly like an untouched compat boot (latch=1
-			 * over live compat video is the HARD WEDGE that
-			 * survives warm reboot and blocks the EFI native
-			 * restore).
-			 */
-			core_link_write_dpcd(pipe->stream->link,
-					     APPLE_5K_DPCD_PANEL_LATCH,
-					     &zero, sizeof(zero));
-			pipe->stream->link->apple5k_armed = false;
-			DC_LOG_INFO("APPLE5K: latch attempt failed -- reset 0x4F1=0 (un-wedged; EFI can restore native on warm reboot)\n");
-		}
+		tiled_pair_sample_native_latch(pipe->stream->link,
+					       "post-sync joint unblank");
+		/*
+		 * NOTE: the failure "reset 0x4F1=0" is intentionally DISABLED.
+		 * Leave the latch in whatever state the arm left it so the
+		 * post-enable panel/AUX state can be inspected on a wedged
+		 * boot; re-enable the disarm once the arm mechanism works.
+		 */
 
 		/*
 		 * The arm sequence has resolved (the combined enable ran): the

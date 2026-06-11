@@ -208,18 +208,30 @@ static bool amdgpu_dm_link_is_tiled_stitch_slave(const struct dc_link *link)
 
 /*
  * Tile geometry of a stitchable connector: exactly two side-by-side tiles
- * of one monitor. Fills the per-tile size from the DisplayID tile block.
+ * of one monitor. The per-tile size comes from the DisplayID tile block.
+ * Because we HIDE connector->has_tile from drm_client (so the fbconsole
+ * doesn't drive the root at the per-tile size), the geometry is stashed on
+ * the aconnector the first time it's seen live and read from the stash
+ * thereafter -- this stays valid after has_tile is cleared.
  */
-static bool amdgpu_dm_connector_tiled_stitch_geometry(const struct drm_connector *connector,
+static bool amdgpu_dm_connector_tiled_stitch_geometry(struct drm_connector *connector,
 						      int *tile_w, int *tile_h)
 {
-	if (!connector->has_tile || connector->num_h_tile != 2 ||
-	    connector->num_v_tile != 1 || !connector->tile_h_size ||
-	    !connector->tile_v_size)
+	struct amdgpu_dm_connector *aconn = to_amdgpu_dm_connector(connector);
+
+	/* Capture live tile metadata while it's present (before/at hide time). */
+	if (connector->has_tile && connector->num_h_tile == 2 &&
+	    connector->num_v_tile == 1 && connector->tile_h_size &&
+	    connector->tile_v_size) {
+		aconn->tiled_stitch_tile_w = connector->tile_h_size;
+		aconn->tiled_stitch_tile_h = connector->tile_v_size;
+	}
+
+	if (!aconn->tiled_stitch_tile_w || !aconn->tiled_stitch_tile_h)
 		return false;
 
-	*tile_w = connector->tile_h_size;
-	*tile_h = connector->tile_v_size;
+	*tile_w = aconn->tiled_stitch_tile_w;
+	*tile_h = aconn->tiled_stitch_tile_h;
 	return true;
 }
 
@@ -299,24 +311,30 @@ static void tiled_stitch_set_scaling(struct dc_scaling_info *s, int src_x,
 }
 
 /*
- * A stitched root presents the whole panel as one ordinary display, so hide
- * the userspace-visible TILE blob (otherwise tile-aware compositors would
- * try to stitch with a hidden slave). The kernel-side tile fields are kept:
- * the stitch geometry and the tiled reprobe logic still need them. Must run
- * after every drm_edid_connector_update() of the root, which rebuilds the
- * blob. The slave's blob is left alone; it is hidden via non_desktop.
+ * A stitched root presents the whole panel as one ordinary display. Clear
+ * connector->has_tile so NEITHER userspace (the TILE property blob, which
+ * makes tile-aware compositors try to stitch with the hidden slave) NOR the
+ * kernel fbconsole (drm_client's tiled-mode selection, which would drive the
+ * root at the per-tile 2560 size instead of our synthesized full-width mode)
+ * treats the root as a tile. The per-tile geometry is stashed first so the
+ * stitch helpers keep working. Re-applied after every drm_edid_connector_
+ * update() of the root, which re-parses the tile block and re-sets has_tile.
+ * The slave's tile state is left intact (it is hidden via non_desktop).
  */
 static void amdgpu_dm_tiled_stitch_hide_tile_property(struct amdgpu_dm_connector *aconnector)
 {
 	struct drm_connector *connector = &aconnector->base;
-	bool had_tile = connector->has_tile;
+	int tile_w, tile_h;
 
-	if (!had_tile || !amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link))
+	if (!connector->has_tile ||
+	    !amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link))
 		return;
+
+	/* Stash geometry while has_tile is still live, then hide it for good. */
+	amdgpu_dm_connector_tiled_stitch_geometry(connector, &tile_w, &tile_h);
 
 	connector->has_tile = false;
 	drm_connector_set_tile_property(connector);
-	connector->has_tile = had_tile;
 }
 
 /*
@@ -8974,9 +8992,14 @@ static int amdgpu_dm_add_tiled_stitch_mode(struct drm_connector *connector)
 	if (!amdgpu_dm_connector_tiled_stitch_geometry(connector, &tile_w, &tile_h))
 		return 0;
 
-	/* The per-tile native mode: prefer the (just-promoted) preferred one. */
+	/*
+	 * Find the per-tile native mode by matching the stashed tile size
+	 * directly (NOT via has_tile, which is hidden on the stitch root). The
+	 * per-tile detailed timing is in the EDID regardless of the tile block,
+	 * so it's present in probed_modes. Prefer a preferred one if any.
+	 */
 	list_for_each_entry(mode, &connector->probed_modes, head) {
-		if (!amdgpu_dm_mode_matches_tile_size(connector, mode))
+		if (mode->hdisplay != tile_w || mode->vdisplay != tile_h)
 			continue;
 		if (!tile_mode || (mode->type & DRM_MODE_TYPE_PREFERRED))
 			tile_mode = mode;
@@ -9079,10 +9102,18 @@ amdgpu_dm_reprobe_tiled_root_after_slave(struct amdgpu_device *adev)
 	amdgpu_dm_log_apple5k_connector_tile(primary,
 					      "root-before-reread");
 
-	if (primary->base.has_tile) {
+	/*
+	 * Already flipped to the tiled identity? has_tile reflects the live
+	 * tile block, but on a stitch root we hide has_tile after capturing the
+	 * geometry -- so also treat a populated stitch stash as "already
+	 * tiled" to avoid a redundant wire re-read on every slave re-detect.
+	 */
+	if (primary->base.has_tile || primary->tiled_stitch_tile_w) {
 		drm_info(dev,
-			 "APPLE5K: root re-read skipped primary already tile connector=%s loc=%u,%u grid=%ux%u size=%ux%u\n",
-			 primary->base.name, primary->base.tile_h_loc,
+			 "APPLE5K: root re-read skipped primary already tile connector=%s has_tile=%d stash=%dx%d loc=%u,%u grid=%ux%u size=%ux%u\n",
+			 primary->base.name, primary->base.has_tile,
+			 primary->tiled_stitch_tile_w, primary->tiled_stitch_tile_h,
+			 primary->base.tile_h_loc,
 			 primary->base.tile_v_loc, primary->base.num_h_tile,
 			 primary->base.num_v_tile, primary->base.tile_h_size,
 			 primary->base.tile_v_size);
@@ -10041,6 +10072,12 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
 	amdgpu_dm_make_tile_mode_preferred(connector);
 	amdgpu_dm_connector->num_modes +=
 		amdgpu_dm_add_tiled_stitch_mode(connector);
+	/*
+	 * Stitch root: ensure has_tile is hidden right before drm_client reads
+	 * it (so the fbconsole picks the synthesized full-width mode, not the
+	 * per-tile size). Geometry was stashed, so this is safe and idempotent.
+	 */
+	amdgpu_dm_tiled_stitch_hide_tile_property(amdgpu_dm_connector);
 	amdgpu_dm_log_apple5k_modes(connector, "get-modes");
 	amdgpu_dm_log_apple5k_connector_tile(amdgpu_dm_connector,
 					      "get-modes");
