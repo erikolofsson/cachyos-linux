@@ -397,6 +397,7 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 		if (peer_pipe) {
 			peer_pipe->stream->link->apple5k_arming = false;
 			peer_pipe->stream->link->wa_flags.dp_keep_receiver_powered = false;
+			peer_pipe->stream->link->skip_fallback_on_link_loss = false;
 		}
 	}
 }
@@ -2464,8 +2465,10 @@ static enum dc_status enable_link_dp(struct dc_state *state,
 			if (armed || hs_status == DC_OK) {
 				link->apple5k_arming = true;
 				link->wa_flags.dp_keep_receiver_powered = true;
-				if (link->tiled_peer)
+				if (link->tiled_peer) {
 					link->tiled_peer->wa_flags.dp_keep_receiver_powered = true;
+					link->tiled_peer->skip_fallback_on_link_loss = true;
+				}
 			}
 
 			/* Diagnostic: panel mode state right after the arm. */
