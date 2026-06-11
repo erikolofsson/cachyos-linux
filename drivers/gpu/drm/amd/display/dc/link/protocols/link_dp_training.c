@@ -1838,22 +1838,22 @@ bool perform_link_training_with_retries(
 		link_hwss->setup_stream_encoder(pipe_ctx);
 
 	/*
-	 * APPLE5K: armed tiled slave -- the first training attempt after the
-	 * arm consistently trains and then immediately drops lock
-	 * (LINK_TRAINING_LINK_LOSS, interlane align lost), and only the retry
-	 * that follows dp_disable_link_phy's sink D3 + PHY power cycle holds.
-	 * Replicate that winning precondition BEFORE the first attempt (sink
-	 * to D3, settle; attempt 1's dp_enable_link_phy restores D0) so
-	 * attempt 1 trains clean and the armed window stays free of the
-	 * fail -> power-down -> retrain churn the firmware never produces.
+	 * APPLE5K: armed tiled slave. The bisect samples localized the TCON
+	 * fault (0x424 bit2) to the tile1 bring-up window, and the one event
+	 * common to every faulting boot is a DP_SET_POWER=D3 write to tile1
+	 * while armed (previous boot: the LT-retry path's dp_disable_link_phy;
+	 * last boot: the deliberate pre-LT D3 cycle). The firmware never
+	 * powers a sink down between arm and enable -- and the root, which
+	 * never got a D3, trained without faulting. So: NO D3 here. Keep the
+	 * 20ms settle (the D3+settle pre-cycle made attempt 1 train clean;
+	 * this isolates which ingredient mattered), and
+	 * wa_flags.dp_keep_receiver_powered (held while arming) keeps the
+	 * retry path from writing D3 if attempt 1 still drops lock.
 	 */
 	if (dc_link_apple5k_arming(link) &&
 	    dc_link_has_tiled_slave_panel_patch(link)) {
-		uint8_t power = DP_SET_POWER_D3;
-
-		core_link_write_dpcd(link, DP_SET_POWER, &power, sizeof(power));
 		msleep(20);
-		DC_LOG_INFO("APPLE5K: pre-LT slave sink power cycle link[%u] (D3 now, D0 at attempt 1)\n",
+		DC_LOG_INFO("APPLE5K: pre-LT slave settle link[%u] (no D3 -- D3-while-armed is the suspected fault trigger)\n",
 			    link->link_index);
 	}
 

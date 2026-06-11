@@ -383,6 +383,15 @@ enum dc_status link_apple_5k_arm_handshake(struct dc_link *root_link)
 		 */
 		root_link->apple5k_armed = true;
 		root_link->apple5k_arming = true;
+		/*
+		 * NO sink of the pair may be powered down (DP_SET_POWER=D3)
+		 * while armed -- the D3 to tile1 is the suspected TCON fault
+		 * trigger. This gates dpcd_write_rx_power_ctrl(false) in
+		 * dp_disable_link_phy (e.g. the link-training retry path).
+		 */
+		root_link->wa_flags.dp_keep_receiver_powered = true;
+		if (root_link->tiled_peer)
+			root_link->tiled_peer->wa_flags.dp_keep_receiver_powered = true;
 		link_apple_5k_sample_panel_state(root_link, "arm-exit", NULL);
 		return DC_OK;
 	}
@@ -393,6 +402,9 @@ enum dc_status link_apple_5k_arm_handshake(struct dc_link *root_link)
 			     &latch, sizeof(latch));
 	root_link->apple5k_armed = false;
 	root_link->apple5k_arming = false;
+	root_link->wa_flags.dp_keep_receiver_powered = false;
+	if (root_link->tiled_peer)
+		root_link->tiled_peer->wa_flags.dp_keep_receiver_powered = false;
 	link_apple_5k_sample_panel_state(root_link, "arm-FAILED-disarmed", NULL);
 	return DC_ERROR_UNEXPECTED;
 }

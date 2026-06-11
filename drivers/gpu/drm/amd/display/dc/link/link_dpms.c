@@ -393,8 +393,11 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 		 * offs disarm-then-power-down normally.
 		 */
 		pipe->stream->link->apple5k_arming = false;
-		if (peer_pipe)
+		pipe->stream->link->wa_flags.dp_keep_receiver_powered = false;
+		if (peer_pipe) {
 			peer_pipe->stream->link->apple5k_arming = false;
+			peer_pipe->stream->link->wa_flags.dp_keep_receiver_powered = false;
+		}
 	}
 }
 
@@ -2454,10 +2457,16 @@ static enum dc_status enable_link_dp(struct dc_state *state,
 
 			/*
 			 * Either way the latch is now armed and the combined
-			 * enable is imminent: hold VDD on until it resolves.
+			 * enable is imminent: hold VDD on until it resolves,
+			 * and forbid sink D3 on the pair (suspected TCON
+			 * fault trigger) for the rest of the armed window.
 			 */
-			if (armed || hs_status == DC_OK)
+			if (armed || hs_status == DC_OK) {
 				link->apple5k_arming = true;
+				link->wa_flags.dp_keep_receiver_powered = true;
+				if (link->tiled_peer)
+					link->tiled_peer->wa_flags.dp_keep_receiver_powered = true;
+			}
 
 			/* Diagnostic: panel mode state right after the arm. */
 			tiled_pair_sample_native_latch(link, "post re-arm");
