@@ -164,7 +164,8 @@ static struct pipe_ctx *get_tiled_peer_pipe(struct dc_state *state,
  * like an EFI-native handoff -- otherwise the next blank/probe churn drives
  * a tile solo and drops the panel back to compat.
  */
-static void tiled_pair_sample_native_latch(struct dc_link *root_link)
+static void tiled_pair_sample_native_latch(struct dc_link *root_link,
+					   const char *stage)
 {
 	uint8_t mode = 0;
 	enum dc_status status;
@@ -178,8 +179,8 @@ static void tiled_pair_sample_native_latch(struct dc_link *root_link)
 				     APPLE_5K_DPCD_PANEL_MODE_STATUS,
 				     &mode, sizeof(mode));
 	native = status == DC_OK && !(mode & 0x02);
-	DC_LOG_INFO("APPLE5K: post joint-unblank panel mode link[%u] status=%d 0x425=0x%02x -> %s (native_boot was %d)\n",
-		    root_link->link_index, status, mode,
+	DC_LOG_INFO("APPLE5K: panel mode (%s) link[%u] status=%d 0x425=0x%02x -> %s (native_boot was %d)\n",
+		    stage, root_link->link_index, status, mode,
 		    native ? "NATIVE" : "compat",
 		    root_link->apple5k_native_boot);
 
@@ -2201,18 +2202,33 @@ static enum dc_status enable_link_dp(struct dc_state *state,
 		 * cycled (boot-state teardown), which can drop the 0x4F1-armed
 		 * dual-tile state set at detection. Re-arm before link
 		 * training, exactly like the EFI firmware's ComplexDisplayInit
-		 * (0x4F1 -> 10 ms -> program/train/enable). No-op for
-		 * non-tiled roots; skipped on a preserved native boot (the
-		 * pulse helper never writes when the panel booted native).
+		 * arm step: 0x4F1 -> 10 ms -> EDID re-read. The re-read is the
+		 * raw DDC transaction only, so the panel SEES the read; the
+		 * connector state must not be touched from here (no
+		 * mode_config lock, and the EDID is the unchanged tiled AE1E).
+		 * No-op for non-tiled roots; skipped on a preserved native
+		 * boot (the pulse helper never writes when booted native).
 		 */
 		if (dc_link_has_tiled_root_panel_patch(link) &&
 		    !dc_link_apple5k_preserve(link)) {
 			enum dc_status arm_status =
 				link_apple_5k_root_panel_latch_pulse(link);
+			uint8_t edid_offset = 0;
+			uint8_t edid_probe[256];
+			bool edid_read_ok;
 
 			msleep(10);
-			DC_LOG_INFO("APPLE5K: re-armed root 0x4F1 after eDP power-on, before training link[%u] status=%d\n",
-				    link->link_index, arm_status);
+			edid_read_ok = link_query_ddc_data(link->ddc, 0x50,
+							   &edid_offset, 1,
+							   edid_probe,
+							   sizeof(edid_probe));
+			DC_LOG_INFO("APPLE5K: re-armed root 0x4F1 + EDID re-read after eDP power-on, before training link[%u] arm_status=%d edid_read=%d id=%02x %02x %02x %02x\n",
+				    link->link_index, arm_status, edid_read_ok,
+				    edid_probe[8], edid_probe[9],
+				    edid_probe[10], edid_probe[11]);
+
+			/* Diagnostic: panel mode state right after the arm. */
+			tiled_pair_sample_native_latch(link, "post re-arm");
 		}
 	}
 
@@ -2856,7 +2872,8 @@ void link_set_dpms_on(
 			msleep(20);
 			tiled_pair_sample_native_latch(
 				link->tiled_role == DC_TILED_ROLE_ROOT ?
-					link : link->tiled_peer);
+					link : link->tiled_peer,
+				"post joint-unblank");
 		}
 	}
 

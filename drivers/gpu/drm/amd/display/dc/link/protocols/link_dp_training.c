@@ -1106,6 +1106,17 @@ static void dp_pre_link_training_wake(struct dc_link *link)
 	if (!link)
 		return;
 
+	/*
+	 * iMacPro1,1: the EFI firmware arms the panel with a SINGLE 0x4F1
+	 * before programming (re-done before root training on a compat boot)
+	 * and never writes it again during the mode-set; extra pulses here can
+	 * drop the armed state and keep the TCON in compat. The other tiled
+	 * iMac models rely on this pre-training wake.
+	 */
+	if (link->apple5k_imac_pro ||
+	    (link->tiled_peer && link->tiled_peer->apple5k_imac_pro))
+		return;
+
 	if (dc_link_needs_tiled_slave_root_wake(link)) {
 		status = link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
 		DC_LOG_INFO("APPLE5K: root wake 0x4F1 stage=training slave_link[%u] root_link[%d] status=%d\n",

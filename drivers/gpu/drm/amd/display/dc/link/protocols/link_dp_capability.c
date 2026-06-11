@@ -80,6 +80,17 @@ static void dpcd_set_tiled_slave_source_table_revision(
 	    !link->ctx || !link->dc)
 		return;
 
+	/*
+	 * iMacPro1,1: the EFI firmware writes NOTHING in DPCD 0x300-0x4FF
+	 * during the mode-set (exhaustive byte search of the Vega backend);
+	 * the 0x310 source-table write is a macOS/Windows-driver behaviour
+	 * used by the other tiled iMac models. Skip it here so the compat
+	 * bring-up matches the firmware recipe exactly.
+	 */
+	if (link->apple5k_imac_pro ||
+	    (link->tiled_peer && link->tiled_peer->apple5k_imac_pro))
+		return;
+
 	auto_revision = link->ctx->dce_version >= DCE_VERSION_12_0 ?
 			0x05 : 0x04;
 	table_revision[0] = 0x04;
@@ -111,11 +122,20 @@ static bool dp_prepare_source_dpcd_write(struct dc_link *link)
 		enum dc_status power_status;
 		enum dc_status rev_status;
 
-		wake_status = link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
-		DC_LOG_INFO("APPLE5K: root wake 0x4F1 stage=source-dpcd slave_link[%u] root_link[%d] try=%u status=%d\n",
-			    link->link_index,
-			    link->tiled_peer ? (int)link->tiled_peer->link_index : -1,
-			    try, wake_status);
+		/*
+		 * iMacPro1,1: no 0x4F1 outside the single arm step (the EFI
+		 * firmware never re-pulses during the mode-set; doing so can
+		 * drop the armed state). Keep the standard D0 + DPCD_REV AUX
+		 * readiness poll below.
+		 */
+		if (!(link->apple5k_imac_pro ||
+		      (link->tiled_peer && link->tiled_peer->apple5k_imac_pro))) {
+			wake_status = link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
+			DC_LOG_INFO("APPLE5K: root wake 0x4F1 stage=source-dpcd slave_link[%u] root_link[%d] try=%u status=%d\n",
+				    link->link_index,
+				    link->tiled_peer ? (int)link->tiled_peer->link_index : -1,
+				    try, wake_status);
+		}
 
 		power_status = core_link_write_dpcd(link, DP_SET_POWER,
 						    &power_state,
