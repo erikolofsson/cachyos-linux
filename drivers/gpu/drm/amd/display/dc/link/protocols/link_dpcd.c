@@ -31,6 +31,7 @@
  */
 
 #include "link_dpcd.h"
+#include "link_ddc.h"
 #include <drm/display/drm_dp_helper.h>
 #include "dm_helpers.h"
 
@@ -249,11 +250,71 @@ enum dc_status core_link_write_dpcd(
 	return status;
 }
 
-/* Apple 5K dual-tile internal panel: DPCD 0x4F1 = root panel-latch (writing 1
- * wakes the panel; the slave's AUX comes up shortly after), 0x425 = root panel
- * mode STATUS (bit1 set = compat, clear = native). */
+/* Apple 5K dual-tile internal panel: DPCD 0x4F1 = root panel-latch (1 =
+ * present the TILED identity / arm for the combined dual-tile enable; 0 =
+ * reset to the BASE presentation -- in native mode a 0-write live-drops the
+ * panel to compat), 0x425 = root panel mode STATUS (bit1 set = compat, clear
+ * = native). */
 #define APPLE_5K_DPCD_ROOT_PANEL_LATCH 0x4F1
 #define APPLE_5K_DPCD_ROOT_PANEL_MODE_STATUS 0x425
+
+/*
+ * The EFI ComplexDisplayInit arm handshake, RE'd instruction-level from
+ * CoreEG2 fcn.00017cf1 (J137 firmware): the panel presents its BASE identity
+ * (AE1D, EDID product LSB & 3 == 1) or its TILED identity (AE1E, LSB & 3 ==
+ * 2); 0x4F1 selects which. Each write is followed by a 10 ms stall, exactly
+ * like the firmware:
+ *
+ *   phase 1: WHILE the EDID reads tiled, write 0x4F1=0 + re-read -- drive
+ *            the panel to a clean base state (resets any stale armed state);
+ *   phase 2: write 0x4F1=1 + re-read, REQUIRE the tiled identity;
+ *   failure: write 0x4F1=0 -- the firmware's abort paths always disarm.
+ *            A latch left at 1 without the combined enable is the hard wedge
+ *            that survives warm reboot and blocks the EFI native restore.
+ *
+ * All four firmware write sites run with the panel powered and AUX alive,
+ * before any video enable; ComplexDisplayInit touches NO other panel-private
+ * register (0x41C/0x41F/0x425 are panel-maintained status).
+ */
+enum dc_status link_apple_5k_arm_handshake(struct dc_link *root_link)
+{
+	uint8_t latch;
+	uint8_t hdr[16] = { 0 };
+	uint8_t offset = 0;
+	int try;
+
+	if (!dc_link_has_tiled_root_panel_patch(root_link) || !root_link->ddc)
+		return DC_ERROR_UNEXPECTED;
+
+	for (try = 0; try < 3; try++) {
+		if (!link_query_ddc_data(root_link->ddc, 0x50, &offset, 1,
+					 hdr, sizeof(hdr)))
+			break;
+		if ((hdr[0xa] & 3) != 2)
+			break; /* base presentation: clean state */
+		latch = 0;
+		core_link_write_dpcd(root_link,
+				     APPLE_5K_DPCD_ROOT_PANEL_LATCH,
+				     &latch, sizeof(latch));
+		msleep(10);
+	}
+
+	latch = 1;
+	core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
+			     &latch, sizeof(latch));
+	msleep(10);
+
+	if (link_query_ddc_data(root_link->ddc, 0x50, &offset, 1,
+				hdr, sizeof(hdr)) &&
+	    (hdr[0xa] & 3) == 2)
+		return DC_OK; /* armed: the panel presents the tiled EDID */
+
+	/* The arm did not take: disarm rather than leave a wedge-armed latch. */
+	latch = 0;
+	core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
+			     &latch, sizeof(latch));
+	return DC_ERROR_UNEXPECTED;
+}
 
 enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
 {
@@ -266,12 +327,14 @@ enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
 	 * iMac Pro only: this is the earliest tiled-root AUX access at boot, before
 	 * amdgpu's modeset touches the panel, so sample the EFI-handed-off panel
 	 * mode (DPCD 0x425) ONCE here -- apple5k_native_boot then gates every
-	 * preservation path (dc_link_apple5k_preserve). When the iMac Pro booted
-	 * native we preserve that by NOT touching the panel (skip the wake write;
-	 * the slave is already up). A compat boot falls through to the latch
-	 * write below like every other iMac model -- per the EFI
-	 * ComplexDisplayInit RE the 0x4F1 wake is the host's arm step for the
-	 * combined dual-tile bring-up.
+	 * preservation path (dc_link_apple5k_preserve). On a native boot the
+	 * latch is NEVER touched. On a compat boot, run the firmware's verified
+	 * arm handshake ONCE: it makes the root re-present the tiled EDID for
+	 * detection, and the 1-write is also what exposes the slave tile (the
+	 * firmware discovers tile 1 right after its arm). The pre-training
+	 * check in enable_link_dp() re-verifies/re-arms if the boot teardown
+	 * dropped it. Every other iMac model keeps the unconditional latch
+	 * write below to wake its slave tile for detection.
 	 */
 	if (root_link->apple5k_imac_pro) {
 		if (!root_link->apple5k_native_sampled) {
@@ -283,8 +346,11 @@ enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
 			root_link->apple5k_native_boot = !(mode & 0x02);
 			root_link->apple5k_native_sampled = true;
 		}
-		if (root_link->apple5k_native_boot)
+		if (root_link->apple5k_native_boot ||
+		    root_link->apple5k_armed)
 			return DC_OK;
+		root_link->apple5k_armed = true;
+		return link_apple_5k_arm_handshake(root_link);
 	}
 
 	return core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,

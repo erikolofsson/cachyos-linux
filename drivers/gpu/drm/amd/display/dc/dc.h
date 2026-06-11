@@ -1786,6 +1786,8 @@ enum dc_tiled_role {
 	bool apple5k_imac_pro;
 	bool apple5k_native_boot;
 	bool apple5k_native_sampled;
+	/* Compat boot: the ComplexDisplayInit arm handshake ran (once). */
+	bool apple5k_armed;
 };
 
 struct dc {

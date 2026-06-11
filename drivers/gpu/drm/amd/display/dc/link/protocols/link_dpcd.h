@@ -44,7 +44,16 @@ enum dc_status core_link_write_dpcd(
  * Pulse the Apple 5K root panel-latch DPCD (0x4F1 = 1). Used by the slave-side
  * pre-detect / source-DPCD / link-training paths to wake the panel before
  * touching the slave's AUX. Safe to call with NULL or non-root link — no-op.
+ * On iMacPro1,1 this instead runs the firmware arm handshake once per boot.
  */
 enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link);
+
+/*
+ * The EFI ComplexDisplayInit arm handshake (verified 0->1 latch edge with
+ * EDID re-reads): reset the panel to its base presentation, arm it to present
+ * the tiled identity, verify it took; disarm on failure so the latch is never
+ * left armed without the combined enable (the hard-wedge state).
+ */
+enum dc_status link_apple_5k_arm_handshake(struct dc_link *root_link);
 
 #endif
