@@ -2235,15 +2235,6 @@ static enum dc_status dc_commit_state_no_check(struct dc *dc, struct dc_state *c
 
 	dc_trigger_sync(dc, context);
 
-	/*
-	 * Tiled pair: the two tile pipes' unblanks were deferred through
-	 * apply_ctx_to_hw() so the panel never sees a solo or phase-unaligned
-	 * tile; now that program_timing_sync() has aligned the OTGs, light
-	 * both tiles together (root first -- the firmware's combined-enable
-	 * order).
-	 */
-	dc->link_srv->tiled_pair_post_sync_unblank(dc, context);
-
 	/* Full update should unconditionally be triggered when dc_commit_state_no_check is called */
 	for (i = 0; i < context->stream_count; i++) {
 		uint32_t prev_dsc_changed = context->streams[i]->update_flags.bits.dsc_changed;
@@ -2343,6 +2334,21 @@ static enum dc_status dc_commit_state_no_check(struct dc *dc, struct dc_state *c
 		TRACE_DCN_CLOCK_STATE(&context->bw_ctx.bw.dcn.clk);
 	else
 		TRACE_DCE_CLOCK_STATE(&context->bw_ctx.bw.dce);
+
+	/*
+	 * Tiled pair: the two tile pipes' unblanks were deferred through
+	 * apply_ctx_to_hw() so the panel never sees a solo or phase-unaligned
+	 * tile. Light them at the VERY END of the commit -- after the
+	 * surfaces are programmed (first visible frame is real content, not
+	 * blank), after optimize_bandwidth's clock switch and the
+	 * post-optimize OTG re-sync above -- so the combined enable is the
+	 * LAST hardware action, exactly like the firmware's
+	 * ComplexDisplayInit, and the TCON evaluates the armed enable on an
+	 * undisturbed dual-tile signal. (Previously this ran right after the
+	 * first dc_trigger_sync: the TCON then got a dispclk switch plus a
+	 * live-OTG GSL trigger-reset ~22ms after first light.)
+	 */
+	dc->link_srv->tiled_pair_post_sync_unblank(dc, context);
 
 	context->stream_mask = get_stream_mask(dc, context);
 

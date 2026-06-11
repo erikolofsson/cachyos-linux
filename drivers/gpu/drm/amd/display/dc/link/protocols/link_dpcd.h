@@ -56,4 +56,36 @@ enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link);
  */
 enum dc_status link_apple_5k_arm_handshake(struct dc_link *root_link);
 
+/*
+ * Snapshot of the Apple 5K root panel's private mode/status registers
+ * (root AUX). Ground truth from native-vs-wedged DPCD dumps:
+ *   0x420-0x427  status block. 0x425 bit1 = compat (clear = native).
+ *                0x423 bit2 + 0x424 bit2 = TCON FAULT flags -- set only in
+ *                the wedged armed-compat state (latch stuck at 1 without an
+ *                accepted combined enable), clear in both native and plain
+ *                compat. While faulted the TCON refuses latch writes and
+ *                only a cold power-off recovers it.
+ *   0x41C        native marker (bit4; panel-maintained, sticks at 0x15 once
+ *                armed).
+ *   0x4F1        the mode latch itself.
+ */
+struct apple5k_panel_state {
+	bool valid;	/* AUX reads succeeded */
+	bool native;	/* 0x425 bit1 clear */
+	bool fault;	/* 0x423 bit2 or 0x424 bit2 set */
+	uint8_t block[8];	/* DPCD 0x420-0x427 */
+	uint8_t marker;	/* DPCD 0x41C */
+	uint8_t latch;	/* DPCD 0x4F1 */
+};
+
+/*
+ * Read the snapshot above off the tiled root's AUX. Logs one
+ * "APPLE5K: panel mode (<stage>)" line unless @stage is NULL (quiet, for
+ * change-polling). Returns false if @root_link is not the tiled root or the
+ * AUX read fails.
+ */
+bool link_apple_5k_sample_panel_state(struct dc_link *root_link,
+				      const char *stage,
+				      struct apple5k_panel_state *state);
+
 #endif

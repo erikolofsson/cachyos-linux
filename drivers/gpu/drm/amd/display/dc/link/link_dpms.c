@@ -212,35 +212,79 @@ static struct pipe_ctx *get_tiled_peer_pipe(struct dc_state *state,
 static bool tiled_pair_sample_native_latch(struct dc_link *root_link,
 					   const char *stage)
 {
-	uint8_t mode = 0;
-	uint8_t marker = 0;
-	uint8_t latch = 0;
-	enum dc_status status;
-	bool native;
+	struct apple5k_panel_state st;
 	DC_LOGGER_INIT(root_link->ctx->logger);
 
-	if (!dc_link_has_tiled_root_panel_patch(root_link))
+	if (!link_apple_5k_sample_panel_state(root_link, stage, &st))
 		return false;
 
-	status = core_link_read_dpcd(root_link,
-				     APPLE_5K_DPCD_PANEL_MODE_STATUS,
-				     &mode, sizeof(mode));
-	core_link_read_dpcd(root_link, APPLE_5K_DPCD_PANEL_MODE_MARKER,
-			    &marker, sizeof(marker));
-	core_link_read_dpcd(root_link, APPLE_5K_DPCD_PANEL_LATCH,
-			    &latch, sizeof(latch));
-	native = status == DC_OK && !(mode & 0x02);
-	DC_LOG_INFO("APPLE5K: panel mode (%s) link[%u] status=%d 0x425=0x%02x 0x41C=0x%02x 0x4F1=0x%02x -> %s (native_boot was %d)\n",
-		    stage, root_link->link_index, status, mode, marker, latch,
-		    native ? "NATIVE" : "compat",
-		    root_link->apple5k_native_boot);
-
-	if (native && !root_link->apple5k_native_boot) {
+	if (st.native && !root_link->apple5k_native_boot) {
 		root_link->apple5k_native_boot = true;
 		DC_LOG_INFO("APPLE5K: panel latched native after combined enable -- preservation paths now active\n");
 	}
 
-	return native;
+	return st.native;
+}
+
+/*
+ * Sample the panel state via the pair's ROOT from any pair-member link --
+ * used to bracket the teardown paths (dpms-off) so the log shows exactly
+ * which step flips the panel mode / fault bits. No-op for non-tiled links.
+ */
+static void tiled_pair_sample_via_root(struct dc_link *link, const char *stage)
+{
+	struct dc_link *root = NULL;
+
+	if (dc_link_has_tiled_root_panel_patch(link))
+		root = link;
+	else if (link && dc_link_has_tiled_root_panel_patch(link->tiled_peer))
+		root = link->tiled_peer;
+
+	if (root)
+		link_apple_5k_sample_panel_state(root, stage, NULL);
+}
+
+/*
+ * Sink-side link health for both tiles: trained-lane status (DPCD
+ * 0x202-0x207) and per-lane symbol error counters (0x210-0x217, bit15 =
+ * count valid). A marginal or dead slave link is invisible in compat mode
+ * (the panel displays only the root tile), yet would make the TCON refuse
+ * native no matter how clean the arm sequence is -- so read what the PANEL
+ * says about each link.
+ */
+static void tiled_pair_log_link_health(struct pipe_ctx *root_pipe,
+				       struct pipe_ctx *peer_pipe,
+				       const char *stage)
+{
+	struct pipe_ctx *pipes[2] = { root_pipe, peer_pipe };
+	int i;
+	DC_LOGGER_INIT(root_pipe->stream->link->ctx->logger);
+
+	for (i = 0; i < 2; i++) {
+		uint8_t lane_status[6] = { 0 };
+		uint8_t err[8] = { 0 };
+		struct dc_link *l;
+
+		if (!pipes[i] || !pipes[i]->stream)
+			continue;
+		l = pipes[i]->stream->link;
+		core_link_read_dpcd(l, DP_LANE0_1_STATUS,
+				    lane_status, sizeof(lane_status));
+		/* 0x210-0x217 SYMBOL_ERROR_COUNT_LANE0-3 (no drm_dp.h define) */
+		core_link_read_dpcd(l, 0x210, err, sizeof(err));
+		DC_LOG_INFO("APPLE5K: link health (%s) link[%u] lane01=0x%02x lane23=0x%02x align=0x%02x sink=0x%02x adj=0x%02x,0x%02x symerr L0=%u%s L1=%u%s L2=%u%s L3=%u%s\n",
+			    stage, l->link_index,
+			    lane_status[0], lane_status[1], lane_status[2],
+			    lane_status[3], lane_status[4], lane_status[5],
+			    ((err[1] & 0x7f) << 8) | err[0],
+			    (err[1] & 0x80) ? "" : "(invalid)",
+			    ((err[3] & 0x7f) << 8) | err[2],
+			    (err[3] & 0x80) ? "" : "(invalid)",
+			    ((err[5] & 0x7f) << 8) | err[4],
+			    (err[5] & 0x80) ? "" : "(invalid)",
+			    ((err[7] & 0x7f) << 8) | err[6],
+			    (err[7] & 0x80) ? "" : "(invalid)");
+	}
 }
 
 /*
@@ -280,10 +324,52 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 			    pipe->stream->link->link_index,
 			    peer_pipe ? (int)peer_pipe->stream->link->link_index : -1);
 
-		/* Give the TCON a beat, then check whether it latched. */
-		msleep(20);
+		/* What does the PANEL say about each tile's link right now? */
+		tiled_pair_log_link_health(pipe, peer_pipe, "post-unblank");
+
+		/*
+		 * Settle window: hold the commit here -- AUX and commit
+		 * silence, the same quiet the firmware gives the TCON after
+		 * its combined enable -- and watch the TCON decide. Poll the
+		 * panel state, logging every change, until it goes NATIVE
+		 * (accepted), latches the fault bits (rejected), or the
+		 * window expires. The single former 20ms sample could not
+		 * distinguish "not decided yet" from "refused".
+		 */
+		{
+			struct apple5k_panel_state prev = { 0 };
+			struct apple5k_panel_state cur;
+			int elapsed = 0;
+
+			msleep(20);
+			link_apple_5k_sample_panel_state(pipe->stream->link,
+					"post-sync joint unblank", &prev);
+			while (elapsed < 2000 && prev.valid &&
+			       !prev.native && !prev.fault) {
+				msleep(50);
+				elapsed += 50;
+				if (!link_apple_5k_sample_panel_state(
+					    pipe->stream->link, NULL, &cur))
+					break;
+				if (memcmp(cur.block, prev.block,
+					   sizeof(cur.block)) ||
+				    cur.marker != prev.marker ||
+				    cur.latch != prev.latch)
+					DC_LOG_INFO("APPLE5K: panel state CHANGED at +%dms 0x425=0x%02x 0x41C=0x%02x 0x4F1=0x%02x 0x423=0x%02x 0x424=0x%02x block=%8ph -> %s%s\n",
+						    elapsed + 20,
+						    cur.block[5], cur.marker,
+						    cur.latch, cur.block[3],
+						    cur.block[4], cur.block,
+						    cur.native ? "NATIVE" : "compat",
+						    cur.fault ? " [TCON-FAULT]" : "");
+				prev = cur;
+			}
+		}
+
+		/* Final verdict; flips native_boot -> preservation on success. */
 		tiled_pair_sample_native_latch(pipe->stream->link,
-					       "post-sync joint unblank");
+					       "post-unblank settle end");
+		tiled_pair_log_link_health(pipe, peer_pipe, "settle end");
 		/*
 		 * NOTE: the failure "reset 0x4F1=0" is intentionally DISABLED.
 		 * Leave the latch in whatever state the arm left it so the
@@ -2670,6 +2756,12 @@ void link_set_dpms_off(struct pipe_ctx *pipe_ctx)
 			set_avmute(pipe_ctx, true);
 	}
 
+	if (dc_link_has_tiled_root_panel_patch(link) ||
+	    dc_link_has_tiled_slave_panel_patch(link))
+		tiled_pair_sample_via_root(link,
+			link->connector_signal == SIGNAL_TYPE_EDP ?
+			"dpms-off entry root" : "dpms-off entry slave");
+
 	dc->hwss.disable_audio_stream(pipe_ctx);
 
 	update_psp_stream_config(pipe_ctx, true);
@@ -2753,6 +2845,12 @@ void link_set_dpms_off(struct pipe_ctx *pipe_ctx)
 		/* since current psp not loaded, we need to reset it to default */
 		link->panel_mode = panel_mode;
 	}
+
+	if (dc_link_has_tiled_root_panel_patch(link) ||
+	    dc_link_has_tiled_slave_panel_patch(link))
+		tiled_pair_sample_via_root(link,
+			link->connector_signal == SIGNAL_TYPE_EDP ?
+			"dpms-off exit root" : "dpms-off exit slave");
 }
 
 void link_set_dpms_on(

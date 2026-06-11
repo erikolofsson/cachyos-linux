@@ -1758,6 +1758,37 @@ enum link_training_result dp_perform_link_training(
 	return status;
 }
 
+/*
+ * APPLE5K: visible-by-default training result for the tiled pair's links.
+ * The dmesg of every from-compat boot shows the slave (link[1]) running
+ * dpcd_set_link_settings three times = two failed attempts -- but the stock
+ * result logs are DC_LOG_HW_LINK_TRAINING (hidden) and nothing ever reads
+ * back what the SINK thought of the final attempt. A marginal slave link is
+ * invisible in compat mode (only the root tile is displayed) yet makes the
+ * TCON refuse native unconditionally.
+ */
+static void apple5k_log_tiled_lt_result(struct dc_link *link,
+					unsigned int attempt,
+					int attempts,
+					const struct dc_link_settings *settings,
+					enum link_training_result result)
+{
+	uint8_t lane_status[6] = { 0 };
+
+	if (!dc_link_has_tiled_root_panel_patch(link) &&
+	    !dc_link_has_tiled_slave_panel_patch(link))
+		return;
+
+	core_link_read_dpcd(link, DP_LANE0_1_STATUS,
+			    lane_status, sizeof(lane_status));
+	DC_LOG_INFO("APPLE5K: LT attempt %u/%d link[%u] result=%d (%s) rate=%d lanes=%d lane01=0x%02x lane23=0x%02x align=0x%02x sink=0x%02x adj=0x%02x,0x%02x\n",
+		    attempt, attempts, link->link_index, result,
+		    result == LINK_TRAINING_SUCCESS ? "SUCCESS" : "FAIL",
+		    settings->link_rate, settings->lane_count,
+		    lane_status[0], lane_status[1], lane_status[2],
+		    lane_status[3], lane_status[4], lane_status[5]);
+}
+
 bool perform_link_training_with_retries(
 	const struct dc_link_settings *link_setting,
 	bool skip_video_pattern,
@@ -1867,6 +1898,9 @@ bool perform_link_training_with_retries(
 			dp_trace_lt_total_count_increment(link, false);
 			dp_trace_lt_result_update(link, status, false);
 			dp_trace_set_lt_end_timestamp(link, false);
+			apple5k_log_tiled_lt_result(link, (unsigned int)j + 1,
+						    attempts,
+						    &cur_link_settings, status);
 			if (status == LINK_TRAINING_SUCCESS && !is_link_bw_low) {
 				// Update verified link settings to current one
 				// Because DPIA LT might fallback to lower link setting.

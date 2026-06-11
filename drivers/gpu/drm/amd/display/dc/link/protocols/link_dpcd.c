@@ -257,6 +257,58 @@ enum dc_status core_link_write_dpcd(
  * = native). */
 #define APPLE_5K_DPCD_ROOT_PANEL_LATCH 0x4F1
 #define APPLE_5K_DPCD_ROOT_PANEL_MODE_STATUS 0x425
+#define APPLE_5K_DPCD_ROOT_PANEL_STATUS_BLOCK 0x420
+#define APPLE_5K_DPCD_ROOT_PANEL_MODE_MARKER 0x41C
+
+#define DC_LOGGER \
+	dc_logger
+#define DC_LOGGER_INIT(logger) \
+	struct dal_logger *dc_logger = logger
+
+bool link_apple_5k_sample_panel_state(struct dc_link *root_link,
+				      const char *stage,
+				      struct apple5k_panel_state *state)
+{
+	struct apple5k_panel_state st = { 0 };
+	enum dc_status status;
+	DC_LOGGER_INIT(root_link->ctx->logger);
+
+	if (state)
+		*state = st;
+	if (!dc_link_has_tiled_root_panel_patch(root_link))
+		return false;
+
+	status = core_link_read_dpcd(root_link,
+				     APPLE_5K_DPCD_ROOT_PANEL_STATUS_BLOCK,
+				     st.block, sizeof(st.block));
+	if (status != DC_OK) {
+		if (stage)
+			DC_LOG_INFO("APPLE5K: panel mode (%s) link[%u] AUX READ FAILED (status=%d)\n",
+				    stage, root_link->link_index, status);
+		return false;
+	}
+	core_link_read_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_MODE_MARKER,
+			    &st.marker, sizeof(st.marker));
+	core_link_read_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
+			    &st.latch, sizeof(st.latch));
+
+	st.valid = true;
+	st.native = !(st.block[5] & 0x02);
+	st.fault = (st.block[3] & 0x04) || (st.block[4] & 0x04);
+
+	if (stage)
+		DC_LOG_INFO("APPLE5K: panel mode (%s) link[%u] 0x425=0x%02x 0x41C=0x%02x 0x4F1=0x%02x 0x423=0x%02x 0x424=0x%02x block=%8ph -> %s%s (native_boot was %d)\n",
+			    stage, root_link->link_index,
+			    st.block[5], st.marker, st.latch,
+			    st.block[3], st.block[4], st.block,
+			    st.native ? "NATIVE" : "compat",
+			    st.fault ? " [TCON-FAULT]" : "",
+			    root_link->apple5k_native_boot);
+
+	if (state)
+		*state = st;
+	return true;
+}
 
 /*
  * The EFI ComplexDisplayInit arm handshake, RE'd instruction-level from
@@ -278,13 +330,30 @@ enum dc_status core_link_write_dpcd(
  */
 enum dc_status link_apple_5k_arm_handshake(struct dc_link *root_link)
 {
+	struct apple5k_panel_state st;
 	uint8_t latch;
 	uint8_t hdr[16] = { 0 };
 	uint8_t offset = 0;
 	int try;
+	DC_LOGGER_INIT(root_link->ctx->logger);
 
 	if (!dc_link_has_tiled_root_panel_patch(root_link) || !root_link->ddc)
 		return DC_ERROR_UNEXPECTED;
+
+	/*
+	 * Wedge detector: if the TCON fault flags (0x423/0x424 bit2) are
+	 * already latched, the TCON is jammed from an earlier failed arm --
+	 * it refuses latch writes and only a cold power-off clears it.
+	 * Arming a faulted TCON is pointless and may deepen the wedge.
+	 */
+	if (link_apple_5k_sample_panel_state(root_link, "arm-entry", &st) &&
+	    st.fault) {
+		DC_LOG_WARNING("APPLE5K: TCON fault latched (0x423=0x%02x 0x424=0x%02x) -- REFUSING to arm; cold power-off required to clear\n",
+			       st.block[3], st.block[4]);
+		root_link->apple5k_armed = false;
+		root_link->apple5k_arming = false;
+		return DC_ERROR_UNEXPECTED;
+	}
 
 	for (try = 0; try < 3; try++) {
 		if (!link_query_ddc_data(root_link->ddc, 0x50, &offset, 1,
@@ -314,6 +383,7 @@ enum dc_status link_apple_5k_arm_handshake(struct dc_link *root_link)
 		 */
 		root_link->apple5k_armed = true;
 		root_link->apple5k_arming = true;
+		link_apple_5k_sample_panel_state(root_link, "arm-exit", NULL);
 		return DC_OK;
 	}
 
@@ -323,6 +393,7 @@ enum dc_status link_apple_5k_arm_handshake(struct dc_link *root_link)
 			     &latch, sizeof(latch));
 	root_link->apple5k_armed = false;
 	root_link->apple5k_arming = false;
+	link_apple_5k_sample_panel_state(root_link, "arm-FAILED-disarmed", NULL);
 	return DC_ERROR_UNEXPECTED;
 }
 
