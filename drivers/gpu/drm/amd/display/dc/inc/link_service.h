@@ -157,6 +157,12 @@ struct link_service {
 	 * program_timing_sync() has phase-aligned the still-blanked OTGs. */
 	void (*tiled_pair_post_sync_unblank)(struct dc *dc,
 			struct dc_state *context);
+	/* eDP VDD power-off guard for the Apple 5K tiled root. Returns true if
+	 * the caller must SKIP the power-off (an arm is in progress and the
+	 * latch must survive to the combined enable; powering down armed wedges
+	 * the TCON). When it returns false it has already disarmed (0x4F1=0) if
+	 * the latch was set, so a genuine power-down never happens armed. */
+	bool (*apple5k_power_off_guard)(struct dc_link *link);
 	void (*resume)(struct dc_link *link);
 	void (*blank_all_dp_displays)(struct dc *dc);
 	void (*blank_all_edp_displays)(struct dc *dc);

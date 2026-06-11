@@ -272,8 +272,21 @@ static void apply_edid_quirks(struct drm_device *dev,
 		 * model keeps its existing tiled-detection path untouched; this just
 		 * tags the link so dc_link_apple5k_preserve() gates the new logic.
 		 */
-		if (link && dmi_match(DMI_PRODUCT_NAME, "iMacPro1,1"))
+		if (link && dmi_match(DMI_PRODUCT_NAME, "iMacPro1,1")) {
 			link->apple5k_imac_pro = true;
+			/*
+			 * The compat->native TCON arm rides the tiled_stitch
+			 * control: run it on a compat boot whenever stitching
+			 * isn't explicitly disabled (it can wedge the panel
+			 * until a cold power-off, but that is the experiment).
+			 * Mirror onto the peer too so either role can consult.
+			 */
+			link->apple5k_compat_arm_enable =
+				amdgpu_tiled_stitch != 0;
+			if (link->tiled_peer)
+				link->tiled_peer->apple5k_compat_arm_enable =
+					link->apple5k_compat_arm_enable;
+		}
 		if (connector_signal == SIGNAL_TYPE_EDP) {
 			edid_caps->panel_patch.tiled_root_force_edid_reread = 1;
 			edid_caps->panel_patch.prefer_tile_native_mode = 1;

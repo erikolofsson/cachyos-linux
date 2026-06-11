@@ -128,6 +128,48 @@ static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 }
 
 /*
+ * eDP VDD power-off guard for the Apple 5K tiled root. Powering the panel down
+ * while the arm latch is set (0x4F1=1) faults the TCON into a stuck-stretched
+ * state that survives warm reboot and is only cleared by a cold power-off --
+ * the EFI firmware never powers down armed (ComplexDisplayInit never power-
+ * cycles between the arm and the combined enable, and its teardown disarms
+ * first). Returns true if the caller must SKIP the power-off:
+ *
+ *   - arm in progress (apple5k_arming): the modeset disable-phase is trying to
+ *     drop VDD between our arm and the combined enable. SKIP it -- keep the
+ *     panel powered (OTG stays blanked separately) so the latch survives to
+ *     the enable, exactly like the firmware's quiet-powered arm.
+ *   - otherwise armed (latch=1) and genuinely powering down: DISARM (0x4F1=0)
+ *     first, then allow the power-off -- never power down armed.
+ */
+bool link_apple5k_power_off_guard(struct dc_link *link)
+{
+	uint8_t latch = 0;
+	DC_LOGGER_INIT(link->ctx->logger);
+
+	if (!dc_link_has_tiled_root_panel_patch(link))
+		return false;
+
+	if (link->apple5k_arming) {
+		DC_LOG_INFO("APPLE5K: keep tiled root eDP VDD on across modeset (arm in progress) link[%u] -- latch must survive to the combined enable\n",
+			    link->link_index);
+		return true; /* suppress the power-off */
+	}
+
+	core_link_read_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
+			    &latch, sizeof(latch));
+	if (latch == 1) {
+		latch = 0;
+		core_link_write_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
+				     &latch, sizeof(latch));
+		link->apple5k_armed = false;
+		DC_LOG_INFO("APPLE5K: disarmed 0x4F1=0 before a genuine eDP VDD power-off link[%u] (never power down armed)\n",
+			    link->link_index);
+	}
+	return false;
+}
+
+/*
  * Find the master pipe in @state driving the other tile of @pipe_ctx's
  * dual-tile pair (dc_link.tiled_peer), or NULL. Used to order the pair's
  * unblanks so the panel never sees a solo tile.
@@ -255,8 +297,19 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 			core_link_write_dpcd(pipe->stream->link,
 					     APPLE_5K_DPCD_PANEL_LATCH,
 					     &zero, sizeof(zero));
+			pipe->stream->link->apple5k_armed = false;
 			DC_LOG_INFO("APPLE5K: latch attempt failed -- reset 0x4F1=0 (un-wedged; EFI can restore native on warm reboot)\n");
 		}
+
+		/*
+		 * The arm sequence has resolved (the combined enable ran): the
+		 * latch no longer needs to survive a power-off mid-sequence.
+		 * Clear arm-in-progress on both tiles so future genuine power-
+		 * offs disarm-then-power-down normally.
+		 */
+		pipe->stream->link->apple5k_arming = false;
+		if (peer_pipe)
+			peer_pipe->stream->link->apple5k_arming = false;
 	}
 }
 
@@ -2279,7 +2332,8 @@ static enum dc_status enable_link_dp(struct dc_state *state,
 		 * preserved native boot.
 		 */
 		if (dc_link_has_tiled_root_panel_patch(link) &&
-		    !dc_link_apple5k_preserve(link)) {
+		    !dc_link_apple5k_preserve(link) &&
+		    link->apple5k_compat_arm_enable) {
 			uint8_t latch = 0;
 			uint8_t hdr[16] = { 0 };
 			uint8_t edid_offset = 0;
@@ -2297,6 +2351,13 @@ static enum dc_status enable_link_dp(struct dc_state *state,
 				    link->link_index, latch, hdr[0xa],
 				    armed ? "already armed" : "re-ran handshake",
 				    hs_status);
+
+			/*
+			 * Either way the latch is now armed and the combined
+			 * enable is imminent: hold VDD on until it resolves.
+			 */
+			if (armed || hs_status == DC_OK)
+				link->apple5k_arming = true;
 
 			/* Diagnostic: panel mode state right after the arm. */
 			tiled_pair_sample_native_latch(link, "post re-arm");

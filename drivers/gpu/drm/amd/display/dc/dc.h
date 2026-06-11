@@ -1788,6 +1788,24 @@ enum dc_tiled_role {
 	bool apple5k_native_sampled;
 	/* Compat boot: the ComplexDisplayInit arm handshake ran (once). */
 	bool apple5k_armed;
+	/*
+	 * Arm-in-progress: the latch is armed (1) and the combined dual-tile
+	 * enable that must follow it has NOT yet completed. While set, the eDP
+	 * VDD must NOT be powered off (powering down armed wedges the TCON, and
+	 * the firmware never power-cycles between arm and enable) -- the modeset
+	 * disable-phase power-off is suppressed instead, leaving the panel
+	 * powered-but-blanked (the firmware's quiet-link arm state). Cleared
+	 * once the enable resolves (native or compat).
+	 */
+	bool apple5k_arming;
+	/*
+	 * Whether the compat->native TCON arm runs on a non-Apple boot. Tied
+	 * to amdgpu.tiled_stitch (true unless stitching is explicitly disabled
+	 * with tiled_stitch=0). When false the 0x4F1 latch is never written on
+	 * a compat-booted iMac Pro (panel presented at its native per-tile
+	 * size). Set by amdgpu_dm at EDID-parse time.
+	 */
+	bool apple5k_compat_arm_enable;
 };
 
 struct dc {

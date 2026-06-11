@@ -778,6 +778,18 @@ void dce110_edp_power_control(
 
 	if (!link->panel_cntl)
 		return;
+
+	/*
+	 * Apple 5K: never let the panel VDD drop while the arm latch is set.
+	 * If an arm is in progress, SKIP the power-off entirely so the latch
+	 * survives to the combined dual-tile enable (the panel stays powered
+	 * but blanked, like the firmware's quiet-link arm). Otherwise the
+	 * guard disarms (0x4F1=0) before allowing a genuine power-down --
+	 * powering down armed wedges the TCON.
+	 */
+	if (!power_up && ctx->dc->link_srv->apple5k_power_off_guard(link))
+		return;
+
 	if (power_up !=
 		link->panel_cntl->funcs->is_panel_powered_on(link->panel_cntl)) {
 
@@ -2597,6 +2609,12 @@ enum dc_status dce110_apply_ctx_to_hw(
 		pipe_ctx->tiled_unblank_deferred = false;
 		dc->hwss.unblank_stream(pipe_ctx,
 			&pipe_ctx->stream->link->cur_link_settings);
+		/*
+		 * Orphaned arm (peer enable never reached its unblank): the arm
+		 * window is over, so don't keep VDD pinned on. The post-sync
+		 * handler won't see this un-paired pipe, so clear here.
+		 */
+		pipe_ctx->stream->link->apple5k_arming = false;
 	}
 
 	if (dc->fbc_compressor)

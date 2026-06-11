@@ -114,6 +114,8 @@ static void construct_link_service_dpms(struct link_service *link_srv)
 	link_srv->set_dpms_off = link_set_dpms_off;
 	link_srv->tiled_pair_post_sync_unblank =
 			link_tiled_pair_post_sync_unblank;
+	link_srv->apple5k_power_off_guard =
+			link_apple5k_power_off_guard;
 	link_srv->resume = link_resume;
 	link_srv->blank_all_dp_displays = link_blank_all_dp_displays;
 	link_srv->blank_all_edp_displays = link_blank_all_edp_displays;

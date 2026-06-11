@@ -306,13 +306,23 @@ enum dc_status link_apple_5k_arm_handshake(struct dc_link *root_link)
 
 	if (link_query_ddc_data(root_link->ddc, 0x50, &offset, 1,
 				hdr, sizeof(hdr)) &&
-	    (hdr[0xa] & 3) == 2)
-		return DC_OK; /* armed: the panel presents the tiled EDID */
+	    (hdr[0xa] & 3) == 2) {
+		/*
+		 * Armed: the panel presents the tiled EDID. Mark arm-in-
+		 * progress so the eDP VDD is held on through to the combined
+		 * enable (a power-off while armed wedges the TCON).
+		 */
+		root_link->apple5k_armed = true;
+		root_link->apple5k_arming = true;
+		return DC_OK;
+	}
 
 	/* The arm did not take: disarm rather than leave a wedge-armed latch. */
 	latch = 0;
 	core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
 			     &latch, sizeof(latch));
+	root_link->apple5k_armed = false;
+	root_link->apple5k_arming = false;
 	return DC_ERROR_UNEXPECTED;
 }
 
@@ -346,8 +356,15 @@ enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
 			root_link->apple5k_native_boot = !(mode & 0x02);
 			root_link->apple5k_native_sampled = true;
 		}
+		/*
+		 * The compat->native arm is DANGEROUS (a failed arm wedges the
+		 * panel until cold power-off) and opt-in. When disabled, never
+		 * touch the latch on a compat boot -- the panel is presented at
+		 * its native per-tile size instead.
+		 */
 		if (root_link->apple5k_native_boot ||
-		    root_link->apple5k_armed)
+		    root_link->apple5k_armed ||
+		    !root_link->apple5k_compat_arm_enable)
 			return DC_OK;
 		root_link->apple5k_armed = true;
 		return link_apple_5k_arm_handshake(root_link);

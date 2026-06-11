@@ -33,6 +33,7 @@ void link_set_dpms_on(
 void link_set_dpms_off(struct pipe_ctx *pipe_ctx);
 void link_tiled_pair_post_sync_unblank(struct dc *dc,
 		struct dc_state *context);
+bool link_apple5k_power_off_guard(struct dc_link *link);
 void link_resume(struct dc_link *link);
 void link_blank_all_dp_displays(struct dc *dc);
 void link_blank_all_edp_displays(struct dc *dc);
