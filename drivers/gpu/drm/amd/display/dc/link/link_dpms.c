@@ -375,28 +375,48 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 		 */
 
 		/*
-		 * APPLE5K (UPDATE58): DON'T WAIT -- let the panel keep being
-		 * driven. The silent hold proved the 0x423 fault is a watchdog
-		 * (it fired after ~320ms even with ZERO AUX). The firmware never
-		 * blocks: it enables and RETURNS, and the pipeline drives the
-		 * panel continuously thereafter; we instead froze the commit for
-		 * >1s, well past the watchdog deadline. So take ONE quick
-		 * pre-drive snapshot for the log, then RETURN immediately with
-		 * both tiles still lit (NO restore) so the OTGs keep scanning and
-		 * the normal pipeline drives the panel. VERDICT = THE SCREEN:
-		 * native (both tiles sharp, full 5120 geometry) => the freeze was
-		 * the problem; stretched/garbage => not the wait, need real
-		 * driven surfaces. CAVEAT: the later desktop plane commit will
-		 * program real surfaces onto these lit OTGs and may crash (the
-		 * handoff is unsolved) -- observe the screen in the first ~10-30s.
+		 * APPLE5K (UPDATE57): TRUE post-enable silence. Every prior
+		 * "settle" POLLED AUX every 50ms across this window; the firmware
+		 * goes dead silent after its combined enable (UPDATE39 -- the
+		 * TCON may need N clean frames to commit). Both tiles are lit and
+		 * genlocked -- hold the commit here with ZERO AUX for 1.2s (the
+		 * TCON faulted at ~320ms WITH polling), then the settle-end
+		 * sample below reads 0x425 ONCE. NATIVE => the AUX polling was
+		 * the spoiler / silence was the missing key; 0x423 fault anyway
+		 * => the fault is a watchdog for a commit step we never send,
+		 * not poll-induced.
 		 */
+		DC_LOG_INFO("APPLE5K: post-enable SILENT hold 1.2s (no AUX) -- both tiles lit, genlocked\n");
+		msleep(1200);
+
+		/* Final verdict; flips native_boot -> preservation on success. */
 		tiled_pair_sample_native_latch(pipe->stream->link,
-					       "pre-drive (no hold)");
+					       "post-unblank settle end");
 		if (peer_pipe)
 			link_apple_5k_sample_slave_state(
-				peer_pipe->stream->link, "pre-drive");
-		tiled_pair_log_link_health(pipe, peer_pipe, "pre-drive");
-		DC_LOG_INFO("APPLE5K: NOT waiting -- both tiles left lit, pipeline drives the panel (verdict = screen)\n");
+				peer_pipe->stream->link, "settle end");
+		tiled_pair_log_link_health(pipe, peer_pipe, "settle end");
+
+		/*
+		 * Diagnostic: is the TCON fault host-clearable, or sticky until
+		 * cold power? Answers whether a host un-fault step is possible.
+		 */
+		link_apple_5k_try_clear_fault(pipe->stream->link,
+					      "settle end");
+
+		/*
+		 * Verdict captured. Restore both tiles to the normal blanked /
+		 * no-test-pattern state so the later desktop plane commit (which
+		 * programs the real per-tile surface onto these OTGs) is not
+		 * fighting a live test pattern -- that is what crashed the box
+		 * before journald could flush. If the settle log above shows a
+		 * native flip, the next step is to KEEP them lit (drop this
+		 * restore) and hand off test-pattern -> real surface seamlessly.
+		 */
+		apple5k_tiled_tile_video(pipe, false);
+		if (peer_pipe)
+			apple5k_tiled_tile_video(peer_pipe, false);
+		DC_LOG_INFO("APPLE5K: tiles restored (test pattern off, re-blanked) after settle verdict\n");
 
 		/*
 		 * NOTE: the failure "reset 0x4F1=0" is intentionally DISABLED.
