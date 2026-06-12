@@ -1596,6 +1596,7 @@ enum dc_status dce110_apply_single_controller_ctx_to_hw(
 	struct dce_hwseq *hws = dc->hwseq;
 	const struct link_hwss *link_hwss = get_link_hwss(
 			link, &pipe_ctx->link_res);
+	struct pipe_ctx *apple5k_lit_root_pipe = NULL;
 	DC_LOGGER_INIT();
 
 
@@ -1771,6 +1772,7 @@ enum dc_status dce110_apply_single_controller_ctx_to_hw(
 			}
 			if (root_pipe && root_pipe->stream_res.tg &&
 			    root_pipe->stream_res.tg->funcs->set_test_pattern &&
+			    root_pipe->stream_res.tg->funcs->set_blank &&
 			    dc->hwss.unblank_stream) {
 				DC_LOG_INFO("APPLE5K: discriminator -- light ROOT tile (test pattern + unblank) before slave CR link[%u] root_link[%u]\n",
 					    link->link_index,
@@ -1781,15 +1783,36 @@ enum dc_status dce110_apply_single_controller_ctx_to_hw(
 					root_pipe->stream->timing.display_color_depth);
 				root_pipe->stream_res.tg->funcs->set_blank(
 					root_pipe->stream_res.tg, false);
-				root_pipe->tiled_unblank_deferred = false;
 				dc->hwss.unblank_stream(root_pipe,
 					&root_pipe->stream->link->cur_link_settings);
+				apple5k_lit_root_pipe = root_pipe;
 			}
 		}
 	}
 
 	if (!stream->dpms_off)
 		dc->link_srv->set_dpms_on(context, pipe_ctx);
+
+	/*
+	 * APPLE5K discriminator restore: the slave's set_dpms_on above ran its
+	 * clock recovery (the cr-dpcd-written / cr-first-poll probes have now
+	 * fired into the log) with the root tile lit. Put the root back to the
+	 * normal blanked, no-test-pattern state so the rest of this commit and
+	 * the later plane commit are unperturbed -- otherwise an un-blanked
+	 * test-pattern OTG wedges the downstream surface programming and the
+	 * box crashes before journald flushes (the verdict is then lost). The
+	 * post-sync joint unblank still re-lights the pair (deferred flag kept).
+	 */
+	if (apple5k_lit_root_pipe) {
+		DC_LOG_INFO("APPLE5K: discriminator -- restore ROOT tile (test pattern off, OTG re-blanked) after slave CR link[%u]\n",
+			    link->link_index);
+		apple5k_lit_root_pipe->stream_res.tg->funcs->set_test_pattern(
+			apple5k_lit_root_pipe->stream_res.tg,
+			CONTROLLER_DP_TEST_PATTERN_VIDEOMODE,
+			apple5k_lit_root_pipe->stream->timing.display_color_depth);
+		apple5k_lit_root_pipe->stream_res.tg->funcs->set_blank(
+			apple5k_lit_root_pipe->stream_res.tg, true);
+	}
 
 	/* DCN3.1 FPGA Workaround
 	 * Need to enable HPO DP Stream Encoder before setting OTG master enable.
