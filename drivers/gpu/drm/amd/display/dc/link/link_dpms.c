@@ -368,47 +368,26 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 			    pipe->stream->link->link_index,
 			    peer_pipe ? (int)peer_pipe->stream->link->link_index : -1);
 
-		/* What does the PANEL say about each tile's link right now? */
-		tiled_pair_log_link_health(pipe, peer_pipe, "post-unblank");
+		/*
+		 * (The usual "post-unblank" link-health AUX read is intentionally
+		 * skipped here -- it would break the post-enable silence below.
+		 * The "settle end" read after the hold still reports health.)
+		 */
 
 		/*
-		 * Settle window: hold the commit here -- AUX and commit
-		 * silence, the same quiet the firmware gives the TCON after
-		 * its combined enable -- and watch the TCON decide. Poll the
-		 * panel state, logging every change, until it goes NATIVE
-		 * (accepted), latches the fault bits (rejected), or the
-		 * window expires. The single former 20ms sample could not
-		 * distinguish "not decided yet" from "refused".
+		 * APPLE5K (UPDATE57): TRUE post-enable silence. Every prior
+		 * "settle" POLLED AUX every 50ms across this window; the firmware
+		 * goes dead silent after its combined enable (UPDATE39 -- the
+		 * TCON may need N clean frames to commit). Both tiles are lit and
+		 * genlocked -- hold the commit here with ZERO AUX for 1.2s (the
+		 * TCON faulted at ~320ms WITH polling), then the settle-end
+		 * sample below reads 0x425 ONCE. NATIVE => the AUX polling was
+		 * the spoiler / silence was the missing key; 0x423 fault anyway
+		 * => the fault is a watchdog for a commit step we never send,
+		 * not poll-induced.
 		 */
-		{
-			struct apple5k_panel_state prev = { 0 };
-			struct apple5k_panel_state cur;
-			int elapsed = 0;
-
-			msleep(20);
-			link_apple_5k_sample_panel_state(pipe->stream->link,
-					"post-sync joint unblank", &prev);
-			while (elapsed < 2000 && prev.valid &&
-			       !prev.native && !prev.fault) {
-				msleep(50);
-				elapsed += 50;
-				if (!link_apple_5k_sample_panel_state(
-					    pipe->stream->link, NULL, &cur))
-					break;
-				if (memcmp(cur.block, prev.block,
-					   sizeof(cur.block)) ||
-				    cur.marker != prev.marker ||
-				    cur.latch != prev.latch)
-					DC_LOG_INFO("APPLE5K: panel state CHANGED at +%dms 0x425=0x%02x 0x41C=0x%02x 0x4F1=0x%02x 0x423=0x%02x 0x424=0x%02x block=%8ph -> %s%s\n",
-						    elapsed + 20,
-						    cur.block[5], cur.marker,
-						    cur.latch, cur.block[3],
-						    cur.block[4], cur.block,
-						    cur.native ? "NATIVE" : "compat",
-						    cur.fault ? " [TCON-FAULT]" : "");
-				prev = cur;
-			}
-		}
+		DC_LOG_INFO("APPLE5K: post-enable SILENT hold 1.2s (no AUX) -- both tiles lit, genlocked\n");
+		msleep(1200);
 
 		/* Final verdict; flips native_boot -> preservation on success. */
 		tiled_pair_sample_native_latch(pipe->stream->link,
