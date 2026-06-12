@@ -1740,6 +1740,52 @@ enum dc_status dce110_apply_single_controller_ctx_to_hw(
 			pipe_ctx->stream_res.tg->funcs->set_blank(
 				pipe_ctx->stream_res.tg, false);
 		}
+
+		/*
+		 * APPLE5K discriminator (UPDATE53): the TCON faults when the
+		 * SLAVE RX is commanded into CR while the ROOT tile is not
+		 * delivering active video. Before the slave's set_dpms_on, make
+		 * the (already trained) root tile scan a CRTC test pattern and
+		 * unblank its DP stream, so the root link carries valid active
+		 * video at the tiled timing when the slave's 0x102 write fires.
+		 * The CRTC test pattern sources pixels internally (no mem_input
+		 * fetch) -> cannot underflow, so this avoids the -124 hang.
+		 * Throwaway diagnostic: we read the post-sync 0x425/0x424/0x426
+		 * probes; the left tile shows color squares until the later
+		 * plane commit reprograms it.
+		 */
+		if (dc_link_has_tiled_slave_panel_patch(link) &&
+		    link->tiled_peer) {
+			struct pipe_ctx *root_pipe = NULL;
+			int i;
+
+			for (i = 0; i < MAX_PIPES; i++) {
+				struct pipe_ctx *p =
+					&context->res_ctx.pipe_ctx[i];
+
+				if (p->stream &&
+				    p->stream->link == link->tiled_peer) {
+					root_pipe = p;
+					break;
+				}
+			}
+			if (root_pipe && root_pipe->stream_res.tg &&
+			    root_pipe->stream_res.tg->funcs->set_test_pattern &&
+			    dc->hwss.unblank_stream) {
+				DC_LOG_INFO("APPLE5K: discriminator -- light ROOT tile (test pattern + unblank) before slave CR link[%u] root_link[%u]\n",
+					    link->link_index,
+					    root_pipe->stream->link->link_index);
+				root_pipe->stream_res.tg->funcs->set_test_pattern(
+					root_pipe->stream_res.tg,
+					CONTROLLER_DP_TEST_PATTERN_COLORSQUARES,
+					root_pipe->stream->timing.display_color_depth);
+				root_pipe->stream_res.tg->funcs->set_blank(
+					root_pipe->stream_res.tg, false);
+				root_pipe->tiled_unblank_deferred = false;
+				dc->hwss.unblank_stream(root_pipe,
+					&root_pipe->stream->link->cur_link_settings);
+			}
+		}
 	}
 
 	if (!stream->dpms_off)
