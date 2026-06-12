@@ -1512,6 +1512,12 @@ static void program_scaler(const struct dc *dc,
 		&pipe_ctx->plane_res.scl_data);
 }
 
+static void dce110_apply_ctx_for_surface(
+		struct dc *dc,
+		const struct dc_stream_state *stream,
+		int num_planes,
+		struct dc_state *context);
+
 static enum dc_status dce110_enable_stream_timing(
 		struct pipe_ctx *pipe_ctx,
 		struct dc_state *context,
@@ -1590,6 +1596,7 @@ enum dc_status dce110_apply_single_controller_ctx_to_hw(
 	struct dce_hwseq *hws = dc->hwseq;
 	const struct link_hwss *link_hwss = get_link_hwss(
 			link, &pipe_ctx->link_res);
+	DC_LOGGER_INIT();
 
 
 	if (hws->funcs.disable_stream_gating) {
@@ -1694,6 +1701,45 @@ enum dc_status dce110_apply_single_controller_ctx_to_hw(
 			(dc_is_dp_signal(pipe_ctx->stream->signal) ||
 			dc_is_virtual_signal(pipe_ctx->stream->signal)))
 			dc->link_srv->set_dsc_enable(pipe_ctx, true);
+	}
+
+	/*
+	 * APPLE5K compat->native arm: the EFI firmware (RE of
+	 * AmdDisplayBackend.efi apply-config fcn.0001a2d0) programs BOTH tile
+	 * pipes' OTG timing + HUBP/DPP SURFACE + DIG and leaves them scanning
+	 * (un-blanked) BEFORE it link-trains either tile. DC instead trains
+	 * against a blanked OTG with no surface programmed (planes come later
+	 * in program_front_end_for_ctx), and the panel TCON faults (root
+	 * 0x424 bit2, sticky-until-cold-power) during the slave tile's clock
+	 * recovery. Replicate the firmware: for the armed tiled pipe, program
+	 * the plane/surface NOW so the mem_input has a valid framebuffer, then
+	 * un-blank the OTG, so training runs against a live scanning pipe.
+	 *
+	 * Order matters: surface BEFORE un-blank, else the OTG scans an
+	 * unconfigured mem_input -> DCE underflow/hang (the -124 crash).
+	 * Heavily guarded: only the arming window, only a fully-resolved pipe
+	 * (plane_state + mi + xfm + opp). If anything is missing we skip and
+	 * fall through to the normal (blanked) path -- degrade, never crash.
+	 * program_front_end_for_ctx re-programs these surfaces later as usual.
+	 */
+	if (dc_link_apple5k_arming(link) &&
+	    (dc_link_has_tiled_root_panel_patch(link) ||
+	     dc_link_has_tiled_slave_panel_patch(link))) {
+		DC_LOG_INFO("APPLE5K: pre-train surface check (armed tiled) link[%u] plane_state=%p mi=%p xfm=%p opp=%p set_blank=%p\n",
+			    link->link_index, pipe_ctx->plane_state,
+			    pipe_ctx->plane_res.mi, pipe_ctx->plane_res.xfm,
+			    pipe_ctx->stream_res.opp,
+			    pipe_ctx->stream_res.tg->funcs->set_blank);
+		if (pipe_ctx->plane_state &&
+		    pipe_ctx->plane_res.mi && pipe_ctx->plane_res.xfm &&
+		    pipe_ctx->stream_res.opp &&
+		    pipe_ctx->stream_res.tg->funcs->set_blank) {
+			DC_LOG_INFO("APPLE5K: pre-train surface program + un-blank OTG (armed tiled, firmware order) link[%u]\n",
+				    link->link_index);
+			dce110_apply_ctx_for_surface(dc, stream, 1, context);
+			pipe_ctx->stream_res.tg->funcs->set_blank(
+				pipe_ctx->stream_res.tg, false);
+		}
 	}
 
 	if (!stream->dpms_off)

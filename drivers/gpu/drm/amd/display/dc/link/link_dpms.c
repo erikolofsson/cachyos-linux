@@ -385,6 +385,13 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 			link_apple_5k_sample_slave_state(
 				peer_pipe->stream->link, "settle end");
 		tiled_pair_log_link_health(pipe, peer_pipe, "settle end");
+
+		/*
+		 * Diagnostic: is the TCON fault host-clearable, or sticky until
+		 * cold power? Answers whether a host un-fault step is possible.
+		 */
+		link_apple_5k_try_clear_fault(pipe->stream->link,
+					      "settle end");
 		/*
 		 * NOTE: the failure "reset 0x4F1=0" is intentionally DISABLED.
 		 * Leave the latch in whatever state the arm left it so the

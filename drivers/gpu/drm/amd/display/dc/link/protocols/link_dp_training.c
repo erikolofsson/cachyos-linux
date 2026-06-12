@@ -1905,6 +1905,17 @@ bool perform_link_training_with_retries(
 			return true;
 		}
 
+		/*
+		 * APPLE5K compat->native arm: the firmware (RE of
+		 * AmdDisplayBackend.efi fcn.00033670) trains tile1 with the
+		 * FULL AUX handshake -- same TPS1/0x202/0x103-0x106 sequence DC
+		 * uses -- and does NOT fault the TCON. So skip-AUX is NOT the
+		 * fix. The remaining divergence is in HOW we drive CR (PHY drive
+		 * levels / pattern emission), not whether we use AUX. Keep real
+		 * training; the micro-bisect inside the CR sequence pins which
+		 * sub-step trips the TCON.
+		 */
+
 		if (link->aux_access_disabled) {
 			dp_perform_link_training_skip_aux(link, &pipe_ctx->link_res, &cur_link_settings);
 			return true;

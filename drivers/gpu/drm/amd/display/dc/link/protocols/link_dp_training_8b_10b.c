@@ -242,6 +242,14 @@ enum link_training_result perform_8b_10b_clock_recovery_sequence(
 	if (!link->ctx->dc->work_arounds.lt_early_cr_pattern)
 		dp_set_hw_training_pattern(link, link_res, lt_settings->pattern_for_cr, offset);
 
+	/*
+	 * APPLE5K micro-bisect: the PHY is now emitting the CR pattern (TPS1)
+	 * on this link, but NO DPCD 0x102/lane write has gone to the sink yet.
+	 * If the TCON fault appears here, the trigger is the PHY pattern
+	 * emission itself (drive/UNIPHY), not the AUX handshake.
+	 */
+	link_apple_5k_lt_bisect(link, "cr-hw-pattern-only");
+
 	/* najeeb - The synaptics MST hub can put the LT in
 	* infinite loop by switching the VS
 	*/
@@ -273,6 +281,16 @@ enum link_training_result perform_8b_10b_clock_recovery_sequence(
 					lt_settings,
 					offset);
 
+		/*
+		 * APPLE5K micro-bisect: DPCD 0x102 (TPS1) + 0x103-0x106 lane
+		 * settings have now been written to the sink, but we have NOT
+		 * yet polled 0x202. Fault here vs at cr-hw-pattern-only =
+		 * the DPCD training write is the trigger; fault only after the
+		 * poll below = the 0x202 read / lock-wait is.
+		 */
+		if (!retry_count)
+			link_apple_5k_lt_bisect(link, "cr-dpcd-written");
+
 		/* 3. wait receiver to lock-on*/
 		wait_time_microsec = lt_settings->cr_pattern_time;
 
@@ -293,6 +311,10 @@ enum link_training_result perform_8b_10b_clock_recovery_sequence(
 
 		if (dp_check_dpcd_reqeust_status(link, status))
 			return LINK_TRAINING_ABORT;
+
+		/* APPLE5K micro-bisect: first 0x202 poll completed. */
+		if (retry_count == 0)
+			link_apple_5k_lt_bisect(link, "cr-first-poll");
 
 		/* 5. check CR done*/
 		if (dp_is_cr_done(lane_count, dpcd_lane_status)) {

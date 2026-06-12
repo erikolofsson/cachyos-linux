@@ -100,4 +100,11 @@ void link_apple_5k_sample_slave_state(struct dc_link *slave_link,
  */
 void link_apple_5k_lt_bisect(struct dc_link *link, const char *stage);
 
+/*
+ * Diagnostic: if the root TCON fault bits are set, attempt the standard
+ * recovery writes (W1C 0x424/0x423, then 0x426=0 reset) and log whether the
+ * fault is host-clearable or sticky. No-op when not faulted.
+ */
+void link_apple_5k_try_clear_fault(struct dc_link *root_link, const char *stage);
+
 #endif

@@ -311,6 +311,46 @@ bool link_apple_5k_sample_panel_state(struct dc_link *root_link,
 }
 
 /*
+ * Cheap clearability probe: the TCON fault (root 0x424 bit2, 0x423 bit2) sets
+ * during the slave's CR. Is it reversible from the host, or sticky-until-cold-
+ * power? Try the two standard recovery writes -- write-1-to-clear the fault
+ * bits, then if still set a 0x426=0 status-reset -- re-reading after each.
+ * Pure diagnostic; logs whether anything moved. (If a write clears it, we have
+ * a host-side un-fault step to try mid-bring-up; if not, only the firmware's
+ * enable or a cold power can.)
+ */
+void link_apple_5k_try_clear_fault(struct dc_link *root_link, const char *stage)
+{
+	struct apple5k_panel_state st;
+	uint8_t v;
+	DC_LOGGER_INIT(root_link->ctx->logger);
+
+	if (!link_apple_5k_sample_panel_state(root_link, NULL, &st) || !st.fault)
+		return;
+
+	/* W1C attempt on 0x424 then 0x423 (bit2). */
+	v = 0x04;
+	core_link_write_dpcd(root_link, 0x424, &v, sizeof(v));
+	v = 0x04;
+	core_link_write_dpcd(root_link, 0x423, &v, sizeof(v));
+	msleep(5);
+	link_apple_5k_sample_panel_state(root_link, "fault-clear W1C", &st);
+	if (!st.fault) {
+		DC_LOG_INFO("APPLE5K: TCON fault CLEARED by W1C (%s) -- host-recoverable!\n",
+			    stage);
+		return;
+	}
+
+	/* 0x426 status-reset attempt (it reads 0x03 in fault, 0x40 when armed). */
+	v = 0x00;
+	core_link_write_dpcd(root_link, 0x426, &v, sizeof(v));
+	msleep(5);
+	link_apple_5k_sample_panel_state(root_link, "fault-clear 0x426=0", &st);
+	DC_LOG_INFO("APPLE5K: fault-clear result (%s) fault=%d (writes %s)\n",
+		    stage, st.fault, st.fault ? "REFUSED -- sticky" : "took");
+}
+
+/*
  * Same register window read off the SLAVE tile's own AUX (tile1 has its own
  * DPCD space which has never been observed during the armed window -- the
  * TCON may expose per-tile state there that the root-side block doesn't).
