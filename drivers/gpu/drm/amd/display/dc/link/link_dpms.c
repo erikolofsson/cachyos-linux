@@ -288,6 +288,35 @@ static void tiled_pair_log_link_health(struct pipe_ctx *root_pipe,
 }
 
 /*
+ * APPLE5K (UPDATE55): drive / clear a CRTC test pattern on one tiled OTG.
+ * The root-lit discriminator proved the slave-CR fault is gone once a tile
+ * delivers active video; the remaining 0x423 fault appears ~420ms after the
+ * joint unblank because BOTH tiles then go dark (blanked, no surface). So
+ * here -- after program_timing_sync() has frequency/phase aligned the OTGs --
+ * light BOTH with a test pattern so the pair keeps delivering active video
+ * through the settle window (the CRTC pattern sources pixels internally, no
+ * mem_input fetch, so it cannot underflow). on=false restores the normal
+ * blanked / no-pattern state so the later desktop plane commit is unperturbed;
+ * the real per-tile surface (two independent 2560 planes -- the model that
+ * natively works, no single coherent 5120 buffer needed) takes over then.
+ */
+static void apple5k_tiled_tile_video(struct pipe_ctx *p, bool on)
+{
+	struct timing_generator *tg;
+
+	if (!p || !p->stream || !p->stream_res.tg)
+		return;
+	tg = p->stream_res.tg;
+	if (!tg->funcs->set_test_pattern || !tg->funcs->set_blank)
+		return;
+	tg->funcs->set_test_pattern(tg,
+		on ? CONTROLLER_DP_TEST_PATTERN_COLORSQUARES
+		   : CONTROLLER_DP_TEST_PATTERN_VIDEOMODE,
+		p->stream->timing.display_color_depth);
+	tg->funcs->set_blank(tg, on ? false : true);
+}
+
+/*
  * Light a dual-tile pair whose unblanks were deferred through
  * apply_ctx_to_hw(). Called from dc_commit_state_no_check() right after
  * program_timing_sync() has phase-aligned the still-blanked OTGs, so the
@@ -324,13 +353,16 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 				peer_pipe->stream->link, "pre-unblank");
 
 		pipe->tiled_unblank_deferred = false;
+		apple5k_tiled_tile_video(pipe, true);
 		dc->hwss.unblank_stream(pipe,
 			&pipe->stream->link->cur_link_settings);
 		if (peer_pipe && peer_pipe->tiled_unblank_deferred) {
 			peer_pipe->tiled_unblank_deferred = false;
+			apple5k_tiled_tile_video(peer_pipe, true);
 			dc->hwss.unblank_stream(peer_pipe,
 				&peer_pipe->stream->link->cur_link_settings);
 		}
+		DC_LOG_INFO("APPLE5K: both tiles lit (test pattern) + sustained through settle -- watching for native\n");
 
 		DC_LOG_INFO("APPLE5K: post-sync joint unblank tiled pair link[%u] + link[%d]\n",
 			    pipe->stream->link->link_index,
@@ -392,6 +424,21 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 		 */
 		link_apple_5k_try_clear_fault(pipe->stream->link,
 					      "settle end");
+
+		/*
+		 * Verdict captured. Restore both tiles to the normal blanked /
+		 * no-test-pattern state so the later desktop plane commit (which
+		 * programs the real per-tile surface onto these OTGs) is not
+		 * fighting a live test pattern -- that is what crashed the box
+		 * before journald could flush. If the settle log above shows a
+		 * native flip, the next step is to KEEP them lit (drop this
+		 * restore) and hand off test-pattern -> real surface seamlessly.
+		 */
+		apple5k_tiled_tile_video(pipe, false);
+		if (peer_pipe)
+			apple5k_tiled_tile_video(peer_pipe, false);
+		DC_LOG_INFO("APPLE5K: tiles restored (test pattern off, re-blanked) after settle verdict\n");
+
 		/*
 		 * NOTE: the failure "reset 0x4F1=0" is intentionally DISABLED.
 		 * Leave the latch in whatever state the arm left it so the
