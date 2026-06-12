@@ -388,10 +388,10 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 			msleep(20);
 			link_apple_5k_sample_panel_state(pipe->stream->link,
 					"post-sync joint unblank", &prev);
-			while (elapsed < 2000 && prev.valid &&
+			while (elapsed < 100 && prev.valid &&
 			       !prev.native && !prev.fault) {
-				msleep(50);
-				elapsed += 50;
+				msleep(10);
+				elapsed += 10;
 				if (!link_apple_5k_sample_panel_state(
 					    pipe->stream->link, NULL, &cur))
 					break;
