@@ -327,50 +327,42 @@ static void apple5k_tiled_tile_video(struct pipe_ctx *p, bool on)
 }
 
 /*
- * APPLE5K (RE_CDActivateDisplay findings 5 / UPDATE61): replay the EFI
- * firmware's per-tile enable sequence on the trained, armed pair.
+ * APPLE5K (RE_CDActivateDisplay findings 5 / UPDATE63): replay the EFI
+ * firmware's per-tile stream-master re-enable EDGE on the trained, armed
+ * pair, RUN-STATE-PRESERVING.
  *
- * The Apple backend (AmdDisplayBackend.efi) has NO one-shot commit pulse;
- * each tile is brought up with a clean stream-master reset bracket and the
- * TCON commits native when it sees native timing on cleanly-enabled pipes.
- * Mapping the backend's flat BAR5 byte offsets onto dce_12_0_offset.h
- * (dword = byte/4, DCE base segment 0x34C0, per-pipe stride 0x200 dwords =
- * the backend's 0x800 bytes) resolves the recipe registers:
+ * The Apple backend (AmdDisplayBackend.efi) has no one-shot commit pulse;
+ * each tile is enabled with a clean stream-master bracket and the TCON
+ * commits native when it sees native timing on a cleanly-enabled pipe.
  *
- *   0xeebc -> CRTC[i]_CRTC_CONTROL   bit0  MASTER_EN
- *                                    [9:8] DISABLE_POINT_CNTL
- *                                    bit4  SYNC_RESET_SEL
- *                                    bit12 START_POINT / bit13 FIELD_NUMBER
- *   0xeda8 -> SCL[i]_SCL_UPDATE      bit16 SCL_UPDATE_LOCK (the RE doc's
- *             "DIG reset pulse" is really a scaler update-lock bracket)
- *   0x4e8  -> PIXCLK0_RESYNC_CNTL    bit0 PIXCLK0_RESYNC_ENABLE -- written
- *             by the firmware right after pipe master-enable (fcn.00020150)
- *             and never written anywhere by DC.
+ * The first attempt (Fix 20) transcribed only fcn.000208b0's TEARDOWN half
+ * (clear DISABLE_POINT/START_POINT/FIELD_NUMBER, set SYNC_RESET_SEL) plus a
+ * bare MASTER_EN set, leaving CRTC_CONTROL half-programmed. DC never
+ * restores those run-state bits at runtime, so the next full modeset (the
+ * GDM greeter) hung in the TG enable/wait path. The OTG itself never froze
+ * (plane flips kept completing) and the panel never faulted -- so that run
+ * proved nothing about whether a CLEAN master edge flips native.
  *
- * (Anchors proving the mapping: backend 0xe878-0xe8a0 -> DCP0_GRPH_PRIMARY_
- * SURFACE_ADDRESS/PITCH/HIGH exactly as the +0x60 surface programmer needs,
- * and CRTC1_CRTC_CONTROL - CRTC0_CRTC_CONTROL = 0x200 dwords = the backend
- * instance stride. The doc's section-4 guesses "H/V total"/"DIG reset" for
- * 0xedc4/0xeda8 decode to SCL0_EXT_OVERSCAN_x and SCL_UPDATE instead.)
+ * This version pulses ONLY MASTER_EN: snapshot the live CRTC_CONTROL, drop
+ * MASTER_EN (wait for the OTG to actually stop via CURRENT_MASTER_EN_STATE),
+ * bracket with the SCL update-lock the firmware uses, then write the snapshot
+ * back VERBATIM (MASTER_EN=1 + every run-state bit intact) and wait for the
+ * OTG to resume. PIXCLK0_RESYNC_ENABLE is already set in our flow (observed
+ * 0x1 at entry on Fix 20) so it is left alone.
+ *
+ * Register decode (flat BAR5 byte/4 - 0x34C0; verified, see register-map):
+ *   0xeebc -> CRTC[i]_CRTC_CONTROL  bit0 MASTER_EN, bit16 CURRENT_MASTER_EN_STATE (RO)
+ *   0xeda8 -> SCL[i]_SCL_UPDATE     bit16 SCL_UPDATE_LOCK
  */
 #define APPLE5K_DCE12_REG(reg_name, inst) \
 	(DCE_BASE.instance[0].segment[mm##reg_name##_BASE_IDX] + \
 	 mm##reg_name + (inst) * 0x200)
 
-static uint32_t apple5k_dce12_rmw(struct dc_context *ctx, uint32_t addr,
-				  uint32_t clear, uint32_t set)
-{
-	uint32_t v = dm_read_reg(ctx, addr);
-
-	dm_write_reg(ctx, addr, (v & ~clear) | set);
-	return v;
-}
-
 static void apple5k_replay_fw_tile_enable(struct dc *dc, struct pipe_ctx *p)
 {
 	struct dc_context *ctx = dc->ctx;
-	uint32_t inst, crtc_control, scl_update, pixclk_resync;
-	uint32_t entry, final, pixclk_old;
+	uint32_t inst, crtc_control, scl_update;
+	uint32_t entry, scl, final;
 	int poll_off = 0, poll_on = 0;
 	DC_LOGGER_INIT(dc->ctx->logger);
 
@@ -379,30 +371,32 @@ static void apple5k_replay_fw_tile_enable(struct dc *dc, struct pipe_ctx *p)
 	inst = p->stream_res.tg->inst;
 	crtc_control = APPLE5K_DCE12_REG(CRTC0_CRTC_CONTROL, inst);
 	scl_update = APPLE5K_DCE12_REG(SCL0_SCL_UPDATE, inst);
-	pixclk_resync = APPLE5K_DCE12_REG(PIXCLK0_RESYNC_CNTL, 0);
 
+	/* Snapshot the LIVE, correctly-configured control word (MASTER_EN=1). */
 	entry = dm_read_reg(ctx, crtc_control);
 
-	/* fcn.000208b0 -- the clean stream-master teardown bracket */
-	apple5k_dce12_rmw(ctx, crtc_control, 0x300, 0);   /* DISABLE_POINT=0 */
-	apple5k_dce12_rmw(ctx, crtc_control, 0x3001, 0);  /* MASTER_EN=0 +
-							     START_POINT/FIELD_NUMBER=0 */
+	/* Clean master-disable: drop only bit0, keep every run-state bit. */
+	dm_write_reg(ctx, crtc_control,
+		     entry & ~CRTC0_CRTC_CONTROL__CRTC_MASTER_EN_MASK);
 	while (poll_off < 200 &&
 	       (dm_read_reg(ctx, crtc_control) &
 		CRTC0_CRTC_CONTROL__CRTC_CURRENT_MASTER_EN_STATE_MASK)) {
 		udelay(100);
 		poll_off++;
 	}
-	apple5k_dce12_rmw(ctx, crtc_control, 0, 0x10);     /* SYNC_RESET_SEL=1 */
-	apple5k_dce12_rmw(ctx, crtc_control, 0x300, 0x100); /* DISABLE_POINT=1 */
 
-	/* fcn.000273c0 bracket -- SCL update-lock pulse */
-	apple5k_dce12_rmw(ctx, scl_update, 0, 0x10000);
+	/* SCL update-lock bracket (firmware fcn.000273c0), cleanly set+cleared. */
+	scl = dm_read_reg(ctx, scl_update);
+	dm_write_reg(ctx, scl_update,
+		     scl | SCL0_SCL_UPDATE__SCL_UPDATE_LOCK_MASK);
 	udelay(10);
-	apple5k_dce12_rmw(ctx, scl_update, 0x10000, 0);
+	dm_write_reg(ctx, scl_update,
+		     scl & ~SCL0_SCL_UPDATE__SCL_UPDATE_LOCK_MASK);
 
-	/* fresh MASTER_EN edge -- the firmware's actual per-tile enable */
-	apple5k_dce12_rmw(ctx, crtc_control, 0, 0x1);
+	/* Re-enable: restore the snapshot VERBATIM -> clean MASTER_EN edge with
+	 * the original DISABLE_POINT/START_POINT/FIELD_NUMBER preserved.
+	 */
+	dm_write_reg(ctx, crtc_control, entry);
 	while (poll_on < 200 &&
 	       !(dm_read_reg(ctx, crtc_control) &
 		 CRTC0_CRTC_CONTROL__CRTC_CURRENT_MASTER_EN_STATE_MASK)) {
@@ -411,14 +405,11 @@ static void apple5k_replay_fw_tile_enable(struct dc *dc, struct pipe_ctx *p)
 	}
 	final = dm_read_reg(ctx, crtc_control);
 
-	/* fcn.00020150 -- PIXCLK0 resync enable right after master-enable */
-	pixclk_old = apple5k_dce12_rmw(ctx, pixclk_resync, 0, 0x1);
-
-	DC_LOG_INFO("APPLE5K: fw-enable replay link[%u] tg%u CRTC_CONTROL 0x%08x -> 0x%08x (master off %s @%dx100us, on %s @%dx100us) PIXCLK0_RESYNC 0x%08x -> |1\n",
+	DC_LOG_INFO("APPLE5K: fw-enable replay (run-state preserving) link[%u] tg%u CRTC_CONTROL entry=0x%08x final=0x%08x %s (master off %s @%d, on %s @%d)\n",
 		    p->stream->link->link_index, inst, entry, final,
+		    entry == final ? "RESTORED-OK" : "MISMATCH",
 		    poll_off < 200 ? "ok" : "TIMEOUT", poll_off,
-		    poll_on < 200 ? "ok" : "TIMEOUT", poll_on,
-		    pixclk_old);
+		    poll_on < 200 ? "ok" : "TIMEOUT", poll_on);
 }
 
 /*
@@ -495,7 +486,7 @@ void link_tiled_pair_post_sync_unblank(struct dc *dc, struct dc_state *context)
 			msleep(20);
 			link_apple_5k_sample_panel_state(pipe->stream->link,
 					"post-sync joint unblank", &prev);
-			while (elapsed < 180 && prev.valid &&
+			while (elapsed < 100 && prev.valid &&
 			       !prev.native && !prev.fault) {
 				msleep(10);
 				elapsed += 10;
