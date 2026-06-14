@@ -156,6 +156,36 @@ MODULE_FIRMWARE(FIRMWARE_DCN_36_DMUB);
 MODULE_FIRMWARE(FIRMWARE_DCN_401_DMUB);
 
 #define APPLE5K_PRESERVE_MIN_BPC 10
+#define TILED_STITCH_SYNTH_EDID_BLOCKS 2
+#define TILED_STITCH_SYNTH_EDID_SIZE (TILED_STITCH_SYNTH_EDID_BLOCKS * EDID_LENGTH)
+#define TILED_STITCH_DISPLAYID_20 0x20
+#define TILED_STITCH_DISPLAYID_1X_PRODUCT_TYPE_TEST 0x01
+#define TILED_STITCH_DISPLAYID_1X_PRODUCT_TYPE_PANEL 0x02
+#define TILED_STITCH_DISPLAYID_1X_PRODUCT_TYPE_MONITOR 0x03
+#define TILED_STITCH_DISPLAYID_1X_PRODUCT_TYPE_TV 0x04
+#define TILED_STITCH_DISPLAYID_1X_PRODUCT_TYPE_DIRECT_DRIVE 0x06
+#define TILED_STITCH_DISPLAYID_PRIMARY_USE_TEST 0x01
+#define TILED_STITCH_DISPLAYID_PRIMARY_USE_GENERIC 0x02
+#define TILED_STITCH_DISPLAYID_PRIMARY_USE_TV 0x03
+#define TILED_STITCH_DISPLAYID_PRIMARY_USE_DESKTOP_PRODUCTIVITY 0x04
+#define TILED_STITCH_DISPLAYID_DISPLAY_PARAMETERS 0x21
+#define TILED_STITCH_DISPLAYID_TYPE_7_DETAILED_TIMING 0x22
+#define TILED_STITCH_DISPLAYID_DISPLAY_PARAMETERS_BYTES 29
+#define TILED_STITCH_DISPLAYID_TYPE_7_DETAILED_TIMING_BYTES 20
+#define TILED_STITCH_DISPLAYID_DO_NOT_USE_LUMINANCE 0x8000
+
+struct amdgpu_dm_tiled_stitch_tile_state {
+	bool has_tile;
+	bool tile_is_single_monitor;
+	bool has_tile_group;
+	u8 num_h_tile;
+	u8 num_v_tile;
+	u8 tile_h_loc;
+	u8 tile_v_loc;
+	u16 tile_h_size;
+	u16 tile_v_size;
+	u8 tile_group_data[8];
+};
 
 /*
  * Dual-tile single-display stitching ("tiled stitch"). When enabled for a
@@ -214,7 +244,14 @@ static bool amdgpu_dm_link_is_tiled_stitch_slave(const struct dc_link *link)
 static bool amdgpu_dm_connector_tiled_stitch_geometry(const struct drm_connector *connector,
 						      int *tile_w, int *tile_h)
 {
-	if (!connector->has_tile || connector->num_h_tile != 2 ||
+	const struct amdgpu_dm_connector *aconnector =
+			to_amdgpu_dm_connector(connector);
+
+	if (!connector->has_tile &&
+	    !amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link))
+		return false;
+
+	if (connector->num_h_tile != 2 ||
 	    connector->num_v_tile != 1 || !connector->tile_h_size ||
 	    !connector->tile_v_size)
 		return false;
@@ -357,6 +394,441 @@ static void amdgpu_dm_tiled_stitch_hide_tile_property(struct amdgpu_dm_connector
 	connector->has_tile = false;
 	drm_connector_set_tile_property(connector);
 	connector->has_tile = had_tile;
+}
+
+static void amdgpu_dm_tiled_stitch_save_tile_state(
+		struct drm_connector *connector,
+		struct amdgpu_dm_tiled_stitch_tile_state *tile)
+{
+	memset(tile, 0, sizeof(*tile));
+
+	if (!connector->has_tile)
+		return;
+
+	tile->has_tile = true;
+	tile->tile_is_single_monitor = connector->tile_is_single_monitor;
+	tile->num_h_tile = connector->num_h_tile;
+	tile->num_v_tile = connector->num_v_tile;
+	tile->tile_h_loc = connector->tile_h_loc;
+	tile->tile_v_loc = connector->tile_v_loc;
+	tile->tile_h_size = connector->tile_h_size;
+	tile->tile_v_size = connector->tile_v_size;
+
+	if (connector->tile_group) {
+		tile->has_tile_group = true;
+		memcpy(tile->tile_group_data, connector->tile_group->group_data,
+		       sizeof(tile->tile_group_data));
+	}
+}
+
+static void amdgpu_dm_tiled_stitch_restore_tile_state_hidden(
+		struct drm_connector *connector,
+		const struct amdgpu_dm_tiled_stitch_tile_state *tile)
+{
+	struct drm_tile_group *tg = NULL;
+	int ret;
+
+	if (!tile->has_tile)
+		return;
+
+	if (tile->has_tile_group) {
+		tg = drm_mode_get_tile_group(connector->dev,
+					     tile->tile_group_data);
+		if (!tg)
+			tg = drm_mode_create_tile_group(connector->dev,
+							tile->tile_group_data);
+	}
+
+	if (tile->has_tile_group && !tg) {
+		drm_warn(connector->dev,
+			 "TILED_STITCH: failed to restore internal tile group for %s\n",
+			 connector->name);
+		return;
+	}
+
+	if (connector->tile_group)
+		drm_mode_put_tile_group(connector->dev, connector->tile_group);
+	connector->tile_group = tg;
+	connector->tile_is_single_monitor = tile->tile_is_single_monitor;
+	connector->num_h_tile = tile->num_h_tile;
+	connector->num_v_tile = tile->num_v_tile;
+	connector->tile_h_loc = tile->tile_h_loc;
+	connector->tile_v_loc = tile->tile_v_loc;
+	connector->tile_h_size = tile->tile_h_size;
+	connector->tile_v_size = tile->tile_v_size;
+
+	connector->has_tile = false;
+	ret = drm_connector_set_tile_property(connector);
+	connector->has_tile = true;
+	if (ret)
+		drm_warn(connector->dev,
+			 "TILED_STITCH: failed to keep TILE property hidden for %s: %d\n",
+			 connector->name, ret);
+}
+
+static int amdgpu_dm_tiled_stitch_edid_connector_update(
+		struct amdgpu_dm_connector *aconnector,
+		const struct drm_edid *drm_edid)
+{
+	struct drm_connector *connector = &aconnector->base;
+	struct amdgpu_dm_tiled_stitch_tile_state tile;
+	bool stitch_root;
+	int ret;
+
+	stitch_root = drm_edid &&
+		      amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link);
+	if (stitch_root)
+		amdgpu_dm_tiled_stitch_save_tile_state(connector, &tile);
+
+	ret = drm_edid_connector_update(connector, drm_edid);
+
+	if (!stitch_root)
+		return ret;
+
+	if (connector->has_tile)
+		amdgpu_dm_tiled_stitch_hide_tile_property(aconnector);
+	else
+		amdgpu_dm_tiled_stitch_restore_tile_state_hidden(connector,
+								 &tile);
+
+	return ret;
+}
+
+static void amdgpu_dm_edid_update_block_checksum(u8 *block)
+{
+	u8 sum = 0;
+	unsigned int i;
+
+	block[EDID_LENGTH - 1] = 0;
+	for (i = 0; i < EDID_LENGTH - 1; i++)
+		sum += block[i];
+	block[EDID_LENGTH - 1] = (u8)(0 - sum);
+}
+
+static void amdgpu_dm_displayid_update_checksum(u8 *ext)
+{
+	u8 payload_bytes = ext[2];
+	u8 checksum = 0;
+	unsigned int i;
+	unsigned int checksum_index = 1 + 4 + payload_bytes;
+
+	ext[checksum_index] = 0;
+	for (i = 1; i <= checksum_index; i++)
+		checksum += ext[i];
+	ext[checksum_index] = (u8)(0 - checksum);
+}
+
+static void amdgpu_dm_displayid_put_le16(u8 *dst, u16 value)
+{
+	dst[0] = value & 0xff;
+	dst[1] = value >> 8;
+}
+
+static bool amdgpu_dm_displayid_put_le16_minus_one(u8 *dst, u32 value)
+{
+	if (!value || value > 0x10000)
+		return false;
+
+	value--;
+	dst[0] = value & 0xff;
+	dst[1] = value >> 8;
+	return true;
+}
+
+static bool amdgpu_dm_displayid_put_sync_minus_one(u8 *dst, u32 value,
+						   bool positive)
+{
+	u16 encoded;
+
+	if (!value || value > 0x8000)
+		return false;
+
+	encoded = value - 1;
+	if (positive)
+		encoded |= BIT(15);
+
+	dst[0] = encoded & 0xff;
+	dst[1] = encoded >> 8;
+	return true;
+}
+
+static u8
+amdgpu_dm_tiled_stitch_source_displayid_primary_use(const struct edid *edid)
+{
+	const u8 *raw = (const u8 *)edid;
+	u8 i;
+
+	for (i = 1; i <= edid->extensions; i++) {
+		const u8 *ext = raw + i * EDID_LENGTH;
+
+		if (ext[0] != DISPLAYID_EXT)
+			continue;
+
+		if (ext[1] >= TILED_STITCH_DISPLAYID_20)
+			return ext[3];
+
+		switch (ext[3]) {
+		case TILED_STITCH_DISPLAYID_1X_PRODUCT_TYPE_TEST:
+			return TILED_STITCH_DISPLAYID_PRIMARY_USE_TEST;
+		case TILED_STITCH_DISPLAYID_1X_PRODUCT_TYPE_TV:
+			return TILED_STITCH_DISPLAYID_PRIMARY_USE_TV;
+		case TILED_STITCH_DISPLAYID_1X_PRODUCT_TYPE_PANEL:
+		case TILED_STITCH_DISPLAYID_1X_PRODUCT_TYPE_MONITOR:
+		case TILED_STITCH_DISPLAYID_1X_PRODUCT_TYPE_DIRECT_DRIVE:
+			return TILED_STITCH_DISPLAYID_PRIMARY_USE_DESKTOP_PRODUCTIVITY;
+		default:
+			return TILED_STITCH_DISPLAYID_PRIMARY_USE_GENERIC;
+		}
+	}
+
+	return TILED_STITCH_DISPLAYID_PRIMARY_USE_DESKTOP_PRODUCTIVITY;
+}
+
+static u16 amdgpu_dm_edid_chromaticity_coord_12bit(const struct edid *edid,
+						   u8 coord)
+{
+	static const u8 high_byte[] = { 27, 28, 29, 30, 31, 32, 33, 34 };
+	static const u8 low_byte[] = { 25, 25, 25, 25, 26, 26, 26, 26 };
+	static const u8 low_shift[] = { 6, 4, 2, 0, 6, 4, 2, 0 };
+	const u8 *raw = (const u8 *)edid;
+	u16 value;
+
+	value = raw[high_byte[coord]] << 2;
+	value |= (raw[low_byte[coord]] >> low_shift[coord]) & 0x3;
+
+	return value << 2;
+}
+
+static void amdgpu_dm_displayid_put_chromaticity(u8 *dst, u16 x, u16 y)
+{
+	dst[0] = x & 0xff;
+	dst[1] = ((x >> 8) & 0xf) | ((y & 0xf) << 4);
+	dst[2] = y >> 4;
+}
+
+static bool amdgpu_dm_tiled_stitch_copyable_info_descriptor(
+		const struct detailed_timing *descriptor)
+{
+	if (descriptor->pixel_clock ||
+	    descriptor->data.other_data.pad1)
+		return false;
+
+	switch (descriptor->data.other_data.type) {
+	case EDID_DETAIL_COLOR_MGMT_DATA:
+	case EDID_DETAIL_MONITOR_CPDATA:
+	case EDID_DETAIL_MONITOR_NAME:
+	case EDID_DETAIL_MONITOR_STRING:
+	case EDID_DETAIL_MONITOR_SERIAL:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static void amdgpu_dm_tiled_stitch_fill_dummy_descriptor(
+		struct detailed_timing *descriptor)
+{
+	memset(descriptor, 0, sizeof(*descriptor));
+	descriptor->data.other_data.type = 0x10;
+}
+
+static void amdgpu_dm_tiled_stitch_copy_info_descriptors(
+		struct edid *synthetic, const struct edid *real)
+{
+	u8 src_i;
+	u8 dst_i = 0;
+
+	for (src_i = 0; src_i < ARRAY_SIZE(real->detailed_timings); src_i++) {
+		const struct detailed_timing *descriptor =
+			&real->detailed_timings[src_i];
+
+		if (!amdgpu_dm_tiled_stitch_copyable_info_descriptor(descriptor))
+			continue;
+
+		memcpy(&synthetic->detailed_timings[dst_i++], descriptor,
+		       sizeof(*descriptor));
+		if (dst_i == ARRAY_SIZE(synthetic->detailed_timings))
+			return;
+	}
+
+	while (dst_i < ARRAY_SIZE(synthetic->detailed_timings))
+		amdgpu_dm_tiled_stitch_fill_dummy_descriptor(
+				&synthetic->detailed_timings[dst_i++]);
+}
+
+static bool amdgpu_dm_tiled_stitch_build_synthetic_edid(
+		struct amdgpu_dm_connector *aconnector,
+		const struct drm_display_mode *tile_mode,
+		u8 edid[TILED_STITCH_SYNTH_EDID_SIZE])
+{
+	struct drm_connector *connector = &aconnector->base;
+	const struct edid *real = drm_edid_raw(aconnector->drm_edid);
+	u8 *base = edid;
+	u8 *ext = edid + EDID_LENGTH;
+	u8 *params;
+	u8 *timing;
+	char monitor_name[14] = {0};
+	u32 pixel_clock;
+	u32 hdisplay, hblank, hsync, hsync_width;
+	u32 vdisplay, vblank, vsync, vsync_width;
+	u32 width_tenths_mm, height_tenths_mm;
+	u8 bpc;
+	u8 primary_use;
+
+	if (!real || !tile_mode || !tile_mode->clock)
+		return false;
+	if (tile_mode->htotal <= tile_mode->hdisplay ||
+	    tile_mode->hsync_start <= tile_mode->hdisplay ||
+	    tile_mode->hsync_end <= tile_mode->hsync_start ||
+	    tile_mode->vtotal <= tile_mode->vdisplay ||
+	    tile_mode->vsync_start <= tile_mode->vdisplay ||
+	    tile_mode->vsync_end <= tile_mode->vsync_start)
+		return false;
+
+	hdisplay = tile_mode->hdisplay * 2;
+	hblank = (tile_mode->htotal - tile_mode->hdisplay) * 2;
+	hsync = (tile_mode->hsync_start - tile_mode->hdisplay) * 2;
+	hsync_width = (tile_mode->hsync_end - tile_mode->hsync_start) * 2;
+	vdisplay = tile_mode->vdisplay;
+	vblank = tile_mode->vtotal - tile_mode->vdisplay;
+	vsync = tile_mode->vsync_start - tile_mode->vdisplay;
+	vsync_width = tile_mode->vsync_end - tile_mode->vsync_start;
+	pixel_clock = tile_mode->clock * 2;
+	if (pixel_clock > 0x1000000)
+		return false;
+
+	memset(edid, 0, TILED_STITCH_SYNTH_EDID_SIZE);
+	memcpy(base, real, EDID_LENGTH);
+
+	base[18] = real->version;
+	base[19] = real->revision;
+	base[21] = real->width_cm ? min_t(u16, real->width_cm * 2, 255) : 0;
+	base[22] = real->height_cm;
+	base[24] = real->features & ~(DRM_EDID_FEATURE_CONTINUOUS_FREQ |
+				      DRM_EDID_FEATURE_PREFERRED_TIMING);
+	memset(base + 35, 0, 3);
+	memset(base + 38, 0x01, 16);
+	memset(base + 54, 0, 72);
+	amdgpu_dm_tiled_stitch_copy_info_descriptors((struct edid *)base, real);
+
+	base[126] = 1;
+	amdgpu_dm_edid_update_block_checksum(base);
+
+	primary_use = amdgpu_dm_tiled_stitch_source_displayid_primary_use(real);
+
+	ext[0] = DISPLAYID_EXT;
+	ext[1] = TILED_STITCH_DISPLAYID_20;
+	ext[2] = 3 + TILED_STITCH_DISPLAYID_DISPLAY_PARAMETERS_BYTES +
+		 3 + TILED_STITCH_DISPLAYID_TYPE_7_DETAILED_TIMING_BYTES;
+	ext[3] = primary_use;
+	ext[4] = 0;
+
+	params = ext + 5;
+	params[0] = TILED_STITCH_DISPLAYID_DISPLAY_PARAMETERS;
+	params[1] = 0;
+	params[2] = TILED_STITCH_DISPLAYID_DISPLAY_PARAMETERS_BYTES;
+	width_tenths_mm = base[21] * 100;
+	height_tenths_mm = base[22] * 100;
+	amdgpu_dm_displayid_put_le16(params + 3, min_t(u32, width_tenths_mm, 0xffff));
+	amdgpu_dm_displayid_put_le16(params + 5, min_t(u32, height_tenths_mm, 0xffff));
+	amdgpu_dm_displayid_put_le16(params + 7, hdisplay);
+	amdgpu_dm_displayid_put_le16(params + 9, vdisplay);
+	params[11] = 0; /* left-to-right, top-to-bottom; CIE 1931 */
+	amdgpu_dm_displayid_put_chromaticity(params + 12,
+			amdgpu_dm_edid_chromaticity_coord_12bit(real, 0),
+			amdgpu_dm_edid_chromaticity_coord_12bit(real, 1));
+	amdgpu_dm_displayid_put_chromaticity(params + 15,
+			amdgpu_dm_edid_chromaticity_coord_12bit(real, 2),
+			amdgpu_dm_edid_chromaticity_coord_12bit(real, 3));
+	amdgpu_dm_displayid_put_chromaticity(params + 18,
+			amdgpu_dm_edid_chromaticity_coord_12bit(real, 4),
+			amdgpu_dm_edid_chromaticity_coord_12bit(real, 5));
+	amdgpu_dm_displayid_put_chromaticity(params + 21,
+			amdgpu_dm_edid_chromaticity_coord_12bit(real, 6),
+			amdgpu_dm_edid_chromaticity_coord_12bit(real, 7));
+	amdgpu_dm_displayid_put_le16(params + 24,
+				     TILED_STITCH_DISPLAYID_DO_NOT_USE_LUMINANCE);
+	amdgpu_dm_displayid_put_le16(params + 26,
+				     TILED_STITCH_DISPLAYID_DO_NOT_USE_LUMINANCE);
+	amdgpu_dm_displayid_put_le16(params + 28,
+				     TILED_STITCH_DISPLAYID_DO_NOT_USE_LUMINANCE);
+	bpc = (real->input & DRM_EDID_DIGITAL_DEPTH_MASK) >> 4;
+	params[30] = bpc && bpc <= 6 ? bpc - 1 : 0;
+	params[31] = real->gamma ?: 0xff;
+
+	timing = params + 3 + TILED_STITCH_DISPLAYID_DISPLAY_PARAMETERS_BYTES;
+	timing[0] = TILED_STITCH_DISPLAYID_TYPE_7_DETAILED_TIMING;
+	timing[1] = 0;
+	timing[2] = TILED_STITCH_DISPLAYID_TYPE_7_DETAILED_TIMING_BYTES;
+
+	timing += 3;
+	pixel_clock--;
+	timing[0] = pixel_clock & 0xff;
+	timing[1] = (pixel_clock >> 8) & 0xff;
+	timing[2] = (pixel_clock >> 16) & 0xff;
+	timing[3] = 0x80; /* preferred */
+	if (!amdgpu_dm_displayid_put_le16_minus_one(timing + 4, hdisplay) ||
+	    !amdgpu_dm_displayid_put_le16_minus_one(timing + 6, hblank) ||
+	    !amdgpu_dm_displayid_put_sync_minus_one(timing + 8, hsync,
+			tile_mode->flags & DRM_MODE_FLAG_PHSYNC) ||
+	    !amdgpu_dm_displayid_put_le16_minus_one(timing + 10, hsync_width) ||
+	    !amdgpu_dm_displayid_put_le16_minus_one(timing + 12, vdisplay) ||
+	    !amdgpu_dm_displayid_put_le16_minus_one(timing + 14, vblank) ||
+	    !amdgpu_dm_displayid_put_sync_minus_one(timing + 16, vsync,
+			tile_mode->flags & DRM_MODE_FLAG_PVSYNC) ||
+	    !amdgpu_dm_displayid_put_le16_minus_one(timing + 18, vsync_width))
+		return false;
+
+	amdgpu_dm_displayid_update_checksum(ext);
+	amdgpu_dm_edid_update_block_checksum(ext);
+
+	drm_edid_get_monitor_name(real, monitor_name, sizeof(monitor_name));
+	drm_info(connector->dev,
+		 "TILED_STITCH: synthesized root EDID for %s from source vendor=%*ph product=0x%04x name=\"%s\" mode %ux%u clock=%u image=%ucmx%ucm\n",
+		 connector->name, 2, base + 8, EDID_PRODUCT_ID(real),
+		 monitor_name,
+		 hdisplay, vdisplay, tile_mode->clock * 2,
+		 base[21], base[22]);
+
+	return true;
+}
+
+static bool amdgpu_dm_tiled_stitch_apply_synthetic_edid(
+		struct amdgpu_dm_connector *aconnector,
+		const struct drm_display_mode *tile_mode)
+{
+	struct drm_connector *connector = &aconnector->base;
+	const struct drm_edid *synthetic;
+	const struct drm_edid *old;
+	u8 edid[TILED_STITCH_SYNTH_EDID_SIZE];
+	int ret;
+
+	if (!amdgpu_dm_link_is_tiled_stitch_root(aconnector->dc_link))
+		return false;
+
+	if (!amdgpu_dm_tiled_stitch_build_synthetic_edid(aconnector,
+							 tile_mode, edid))
+		return false;
+
+	synthetic = drm_edid_alloc(edid, sizeof(edid));
+	if (!synthetic)
+		return false;
+
+	ret = amdgpu_dm_tiled_stitch_edid_connector_update(aconnector,
+							   synthetic);
+	if (ret) {
+		drm_warn(connector->dev,
+			 "TILED_STITCH: failed to apply synthetic root EDID on %s: %d\n",
+			 connector->name, ret);
+		drm_edid_free(synthetic);
+		return false;
+	}
+
+	old = aconnector->drm_edid;
+	aconnector->drm_edid = synthetic;
+	drm_edid_free(old);
+
+	return true;
 }
 
 /**
@@ -4150,7 +4622,8 @@ void amdgpu_dm_update_connector_after_detect(
 			const struct edid *edid = (const struct edid *)sink->dc_edid.raw_edid;
 
 			aconnector->drm_edid = drm_edid_alloc(edid, sink->dc_edid.length);
-			drm_edid_connector_update(connector, aconnector->drm_edid);
+			amdgpu_dm_tiled_stitch_edid_connector_update(aconnector,
+								     aconnector->drm_edid);
 
 			/*
 			 * Tiled stitch: Apple iMac peer links are wired at
@@ -8221,7 +8694,7 @@ static void amdgpu_dm_connector_funcs_force(struct drm_connector *connector)
 		ddc = &aconnector->i2c->base;
 
 	drm_edid = drm_edid_read_ddc(connector, ddc);
-	drm_edid_connector_update(connector, drm_edid);
+	amdgpu_dm_tiled_stitch_edid_connector_update(aconnector, drm_edid);
 	if (!drm_edid) {
 		drm_err(dev, "No EDID found on connector: %s.\n", connector->name);
 		return;
@@ -8280,7 +8753,7 @@ static void create_eml_sink(struct amdgpu_dm_connector *aconnector)
 		ddc = &aconnector->i2c->base;
 
 	drm_edid = drm_edid_read_ddc(connector, ddc);
-	drm_edid_connector_update(connector, drm_edid);
+	amdgpu_dm_tiled_stitch_edid_connector_update(aconnector, drm_edid);
 	if (!drm_edid) {
 		drm_err(connector->dev, "No EDID found on connector: %s.\n", connector->name);
 		return;
@@ -8913,6 +9386,7 @@ static int amdgpu_dm_replace_tiled_stitch_modes(struct drm_connector *connector)
 			to_amdgpu_dm_connector(connector);
 	struct drm_display_mode *mode, *tmp;
 	struct drm_display_mode *tile_mode = NULL;
+	struct drm_display_mode *existing_stitched = NULL;
 	struct drm_display_mode *stitched;
 	int tile_w, tile_h;
 
@@ -8923,15 +9397,40 @@ static int amdgpu_dm_replace_tiled_stitch_modes(struct drm_connector *connector)
 
 	/* The per-tile native mode: prefer the (just-promoted) preferred one. */
 	list_for_each_entry(mode, &connector->probed_modes, head) {
+		if (!existing_stitched &&
+		    mode->hdisplay == 2 * tile_w && mode->vdisplay == tile_h)
+			existing_stitched = mode;
+
 		if (!amdgpu_dm_mode_matches_tile_size(connector, mode))
 			continue;
+
 		if (!tile_mode || (mode->type & DRM_MODE_TYPE_PREFERRED))
 			tile_mode = mode;
 		if (mode->type & DRM_MODE_TYPE_PREFERRED)
 			break;
 	}
-	if (!tile_mode)
-		return 0; /* root not re-probed yet; no tile mode to double */
+	if (!tile_mode) {
+		if (!existing_stitched)
+			return 0;
+
+		list_for_each_entry_safe(mode, tmp, &connector->probed_modes, head) {
+			if (mode == existing_stitched) {
+				mode->type = DRM_MODE_TYPE_DRIVER |
+					     DRM_MODE_TYPE_PREFERRED;
+				drm_mode_set_name(mode);
+				continue;
+			}
+
+			list_del(&mode->head);
+			drm_mode_destroy(connector->dev, mode);
+		}
+
+		amdgpu_dm_get_native_mode(connector);
+		drm_info(connector->dev,
+			 "TILED_STITCH: kept synthesized stitched mode %s on %s (tile %dx%d)\n",
+			 existing_stitched->name, connector->name, tile_w, tile_h);
+		return 1;
+	}
 
 	stitched = drm_mode_duplicate(connector->dev, tile_mode);
 	if (!stitched)
@@ -8945,6 +9444,8 @@ static int amdgpu_dm_replace_tiled_stitch_modes(struct drm_connector *connector)
 	stitched->clock       *= 2;
 	stitched->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
 	drm_mode_set_name(stitched);
+
+	amdgpu_dm_tiled_stitch_apply_synthetic_edid(aconnector, tile_mode);
 
 	list_for_each_entry_safe(mode, tmp, &connector->probed_modes, head) {
 		list_del(&mode->head);
@@ -9083,7 +9584,8 @@ amdgpu_dm_reprobe_tiled_root_after_slave(struct amdgpu_device *adev)
 		drm_edid_free(primary->drm_edid);
 		primary->drm_edid = drm_edid_alloc(edid, sink->dc_edid.length);
 		mutex_lock(&dev->mode_config.mutex);
-		drm_edid_connector_update(&primary->base, primary->drm_edid);
+		amdgpu_dm_tiled_stitch_edid_connector_update(primary,
+							     primary->drm_edid);
 		/* The re-read root now carries the tile block; hide it again. */
 		amdgpu_dm_tiled_stitch_hide_tile_property(primary);
 		mutex_unlock(&dev->mode_config.mutex);
@@ -9767,6 +10269,9 @@ static void amdgpu_dm_connector_add_common_modes(struct drm_encoder *encoder,
 
 	if ((connector->connector_type != DRM_MODE_CONNECTOR_eDP) &&
 	    (connector->connector_type != DRM_MODE_CONNECTOR_LVDS))
+		return;
+
+	if (amdgpu_dm_link_is_tiled_stitch_root(amdgpu_dm_connector->dc_link))
 		return;
 
 	n = ARRAY_SIZE(common_modes);
@@ -15046,7 +15551,8 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 		amdgpu_dm_connector->dc_sink :
 		amdgpu_dm_connector->dc_em_sink;
 
-	drm_edid_connector_update(connector, drm_edid);
+	amdgpu_dm_tiled_stitch_edid_connector_update(amdgpu_dm_connector,
+						     drm_edid);
 
 	if (!drm_edid || !sink) {
 		dm_con_state = to_dm_connector_state(connector->state);
